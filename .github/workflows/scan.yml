@@ -254,28 +254,16 @@ jobs:
           echo "schedule_name=$SCHEDULE_NAME" >> $GITHUB_OUTPUT
 
       - name: Test Lambda Function
-        id: test_function
         run: |
           echo "🧪 Testing Lambda function..."
           
-          # Create test event
-          cat > test-event.json << 'EOF'
-          {
-            "source": "test",
-            "detail-type": "Manual Test",
-            "detail": {}
-          }
-          EOF
-          
-          # Invoke function (async to avoid timeout)
           aws lambda invoke \
             --function-name inspector-ec2-scanner \
-            --invocation-type Event \
-            --payload file://test-event.json \
+            --payload '{}' \
             response.json
           
-          echo "✅ Test invocation sent (async)"
-          echo "Check CloudWatch logs for results"
+          echo " Test invocation sent (async)"
+          echo " Check CloudWatch logs: aws logs tail /aws/lambda/inspector-ec2-scanner --follow"
 
       - name: Upload Deployment Artifacts
         uses: actions/upload-artifact@v4
