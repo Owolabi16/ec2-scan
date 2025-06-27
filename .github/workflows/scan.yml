@@ -1,336 +1,310 @@
-name: AWS Inspector EC2 Scheduled Scan
+name: Deploy AWS Inspector Lambda Function
 
 on:
-  # Scheduled trigger - runs monthly (change to quarterly as needed)
-  schedule:
-    # Run on the 1st of every month at 2 AM UTC
-    - cron: '0 2 1 * *'
-    # For quarterly: uncomment below and comment above
-    # - cron: '0 2 1 1,4,7,10 *'  # January, April, July, October
+  push:
+    branches: [main]
   
-  # Manual trigger for testing
   workflow_dispatch:
-    inputs:
-      scan_type:
-        description: 'Type of scan to perform'
-        required: true
-        default: 'PACKAGE_VULNERABILITY'
-        type: choice
-        options:
-          - 'PACKAGE_VULNERABILITY'
-          - 'NETWORK_REACHABILITY'
-      target_instances:
-        description: 'Specific instance IDs to scan (comma-separated, leave empty for all)'
-        required: false
-        type: string
-      environment_filter:
-        description: 'Filter instances by environment tag'
-        required: false
-        type: string
-        default: 'all'
 
 env:
   AWS_REGION: eu-west-2
-  SCAN_TYPE: ${{ github.event.inputs.scan_type || 'PACKAGE_VULNERABILITY' }}
+  LAMBDA_NAME: lambda-deployment
+  LAMBDA_RUNTIME: python3.12
+  LAMBDA_TIMEOUT: 300  # 5 minutes
+  LAMBDA_MEMORY: 256   # MB
+  FUNCTION_NAME: inspector-ec2-scanner
 
 jobs:
-  inspector-ec2-scan:
+  deploy-lambda:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
     permissions:
       id-token: write
       contents: read
     
     steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.aws-github-oidc-iam-role }}
-          role-session-name: InspectorEC2ScanSession
+          role-session-name: LambdaDeploymentSession
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Discover EC2 Instances
-        id: discover_instances
+      - name: Create Lambda Deployment Package
+        id: create_package
         run: |
-          echo "🔍 Discovering EC2 instances..."
+          echo "📦 Creating Lambda deployment package..."
+
+          # Set package name
+          PACKAGE_NAME="lambda-deployment.zip"
           
-          # Build filter based on inputs
-          FILTER_QUERY="Name=instance-state-name,Values=running"
+          # Create deployment directory
+          mkdir -p lambda-package
           
-          if [ "${{ github.event.inputs.environment_filter }}" != "all" ] && [ "${{ github.event.inputs.environment_filter }}" != "" ]; then
-            FILTER_QUERY="$FILTER_QUERY Name=tag:Environment,Values=${{ github.event.inputs.environment_filter }}"
-          fi
+          # Create the Python script inline
+          cat > lambda-package/lambda_function.py << 'EOF'
+          import json, boto3, os
+          from datetime import datetime, timezone
+
+          SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
+          SCAN_TYPE = os.environ.get("SCAN_TYPE", "PACKAGE_VULNERABILITY")
+          ENVIRONMENT_FILTER = os.environ.get("ENVIRONMENT_FILTER", "")
+
+          sns = boto3.client("sns")
+          ec2 = boto3.client("ec2")
+          inspector2 = boto3.client("inspector2")
+
+          def _get_ec2_name_map(instance_ids):
+              """
+              Returns a dict mapping instance-id → Name-tag (or 'Unnamed Instance').
+              """
+              if not instance_ids:
+                  return {}
+
+              resp = ec2.describe_instances(InstanceIds=instance_ids)
+              name_map = {}
+
+              for reservation in resp.get("Reservations", []):
+                  for instance in reservation.get("Instances", []):
+                      iid  = instance["InstanceId"]
+                      tags = instance.get("Tags", [])
+                      name = next((t["Value"] for t in tags if t["Key"] == "Name"), None)
+                      name_map[iid] = name or "Unnamed Instance"
+
+              return name_map
+
+          def _discover_running_instances():
+              """Get all running EC2 instances, optionally filtered by environment."""
+              filters = [{"Name": "instance-state-name", "Values": ["running"]}]
+              
+              if ENVIRONMENT_FILTER:
+                  filters.append({"Name": "tag:Environment", "Values": [ENVIRONMENT_FILTER]})
+              
+              resp = ec2.describe_instances(Filters=filters)
+              
+              instances = []
+              for reservation in resp.get("Reservations", []):
+                  for instance in reservation.get("Instances", []):
+                      instances.append(instance["InstanceId"])
+              
+              print(f"📋 Found {len(instances)} running instances")
+              return instances
+
+          def _create_inspector_scan(instance_ids):
+              """Create and start Inspector scan for given instances."""
+              scan_name = f"ec2-scan-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M')}"
+              
+              response = inspector2.create_scan(
+                  scanName=scan_name,
+                  scanType=SCAN_TYPE,
+                  resources={"resourceIds": instance_ids}
+              )
+              
+              scan_id = response["scanId"]
+              print(f"✅ Created scan: {scan_id}")
+              return scan_id, scan_name
+
+          def _send_scan_notification(scan_id, scan_name, instance_ids):
+              """Send SNS notification about scan initiation."""
+              name_map = _get_ec2_name_map(instance_ids)
+              instance_list = [f"{name_map[iid]}: {iid}" for iid in instance_ids]
+              
+              message = f"""AWS Inspector V2 scan initiated.
+
+          Scan: {scan_name}
+          ID: {scan_id}
+          Type: {SCAN_TYPE}
+          Instances: {len(instance_ids)}
+
+          {chr(10).join(instance_list)}
+
+          Status available in AWS Console."""
+              
+              sns.publish(
+                  TopicArn=SNS_TOPIC_ARN,
+                  Subject=f"Inspector Scan Started - {scan_name}",
+                  Message=message
+              )
+              print("✅ Notification sent")    
+
+          def lambda_handler(event, context):
+              """
+              Triggered by EventBridge scheduled events or manual invocation.
+              Scans EC2 instances using AWS Inspector V2 and sends SNS notification.
+              """
+              print("▶︎ Received event:", json.dumps(event))
+
+              try:
+                  # 1. Discover EC2 instances
+                  ec2_ids = _discover_running_instances()
+                  if not ec2_ids:
+                      print("ℹ︎ No EC2 instances found")
+                      return {"statusCode": 204, "body": "No instances to scan"}
+
+                  # 2. Create Inspector scan
+                  scan_id, scan_name = _create_inspector_scan(ec2_ids)
+                  
+                  # 3. Send notification
+                  _send_scan_notification(scan_id, scan_name, ec2_ids)
+                  
+                  print("✅ Scan initiated successfully")
+                  return {"statusCode": 200, "body": f"Scan started: {scan_id}"}
+                  
+              except Exception as e:
+                  print(f"❌ Error: {str(e)}")
+                  return {"statusCode": 500, "body": f"Failed: {str(e)}"}
+          EOF
           
-          # Get instances
-          if [ "${{ github.event.inputs.target_instances }}" != "" ]; then
-            # Specific instances provided
-            INSTANCE_IDS="${{ github.event.inputs.target_instances }}"
-            echo "🎯 Scanning specific instances: $INSTANCE_IDS"
+          # Create ZIP package
+          cd lambda-package
+          zip -r ../$PACKAGE_NAME .
+          cd ..
+          
+          echo "✅ Package created: $PACKAGE_NAME"
+
+          echo "package_name=$PACKAGE_NAME" >> $GITHUB_OUTPUT
+
+      - name: Deploy Lambda Function
+        run: |
+          FUNCTION_NAME="inspector-ec2-scanner"
+          PACKAGE_NAME="${{ steps.create_package.outputs.package_name }}"
+          
+          echo "🚀 Deploying Lambda function..."
+          
+          if aws lambda get-function --function-name $FUNCTION_NAME 2>/dev/null; then
+            echo "🔄 Updating existing function..."
+            
+            aws lambda update-function-code \
+              --function-name $FUNCTION_NAME \
+              --zip-file fileb://$PACKAGE_NAME
+            
+            aws lambda update-function-configuration \
+              --function-name $FUNCTION_NAME \
+              --runtime ${{ env.LAMBDA_RUNTIME }} \
+              --timeout ${{ env.LAMBDA_TIMEOUT }} \
+              --memory-size ${{ env.LAMBDA_MEMORY }} \
+              --environment Variables="{SNS_TOPIC_ARN=${{ secrets.SNS_TOPIC_ARN }},SCAN_TYPE=PACKAGE_VULNERABILITY,ENVIRONMENT_FILTER=staging}"
+            
+            echo "✅ Function updated"
           else
-            # Discover all running instances
-            INSTANCE_IDS=$(aws ec2 describe-instances \
-              --filters $FILTER_QUERY \
-              --query 'Reservations[].Instances[].InstanceId' \
-              --output text | tr '\t' ',')
-          fi
-          
-          if [ -z "$INSTANCE_IDS" ]; then
-            echo "❌ No instances found matching criteria"
-            exit 1
-          fi
-          
-          echo "📋 Found instances: $INSTANCE_IDS"
-          echo "instance_ids=$INSTANCE_IDS" >> $GITHUB_OUTPUT
-          
-          # Get instance details for reporting
-          aws ec2 describe-instances \
-            --instance-ids $(echo $INSTANCE_IDS | tr ',' ' ') \
-            --query 'Reservations[].Instances[].[InstanceId,InstanceType,State.Name,Tags[?Key==`Name`].Value|[0],Tags[?Key==`Environment`].Value|[0]]' \
-            --output table > instance_details.txt
-          
-          echo "📊 Instance Details:"
-          cat instance_details.txt
-
-      - name: Check Inspector Coverage
-        id: check_coverage
-        run: |
-          echo "🔍 Checking AWS Inspector coverage..."
-          
-          IFS=',' read -ra INSTANCE_ARRAY <<< "${{ steps.discover_instances.outputs.instance_ids }}"
-          
-          COVERED_INSTANCES=""
-          UNCOVERED_INSTANCES=""
-          
-          for instance in "${INSTANCE_ARRAY[@]}"; do
-            # Check if instance is covered by Inspector
-            COVERAGE=$(aws inspector2 describe-coverage \
-              --filter-criteria resourceId="$instance" \
-              --query 'coveredResources[0].scanStatus.statusCode' \
-              --output text 2>/dev/null || echo "NOT_FOUND")
+            echo "🆕 Creating new function..."
             
-            if [ "$COVERAGE" != "NOT_FOUND" ] && [ "$COVERAGE" != "None" ]; then
-              COVERED_INSTANCES="$COVERED_INSTANCES,$instance"
-              echo "✅ $instance is covered (Status: $COVERAGE)"
-            else
-              UNCOVERED_INSTANCES="$UNCOVERED_INSTANCES,$instance"
-              echo "❌ $instance is not covered"
-            fi
-          done
-          
-          # Remove leading comma
-          COVERED_INSTANCES=$(echo $COVERED_INSTANCES | sed 's/^,//')
-          UNCOVERED_INSTANCES=$(echo $UNCOVERED_INSTANCES | sed 's/^,//')
-          
-          echo "covered_instances=$COVERED_INSTANCES" >> $GITHUB_OUTPUT
-          echo "uncovered_instances=$UNCOVERED_INSTANCES" >> $GITHUB_OUTPUT
-          
-          if [ -n "$UNCOVERED_INSTANCES" ]; then
-            echo "⚠️  Warning: Some instances are not covered by Inspector"
+            aws lambda create-function \
+              --function-name $FUNCTION_NAME \
+              --runtime ${{ env.LAMBDA_RUNTIME }} \
+              --role ${{ secrets.LAMBDA_EXECUTION_ROLE_ARN }} \
+              --handler lambda_function.lambda_handler \
+              --zip-file fileb://$PACKAGE_NAME \
+              --timeout ${{ env.LAMBDA_TIMEOUT }} \
+              --memory-size ${{ env.LAMBDA_MEMORY }} \
+              --environment Variables="{SNS_TOPIC_ARN=${{ secrets.SNS_TOPIC_ARN }},SCAN_TYPE=PACKAGE_VULNERABILITY,ENVIRONMENT_FILTER=staging}" \
+              --description "AWS Inspector V2 EC2 Scanner - staging"
+            
+            echo "✅ Function created"
           fi
 
-      - name: Trigger Inspector Scan
-        id: trigger_scan
+      - name: Create EventBridge Schedule (Quarterly - Auto)
+        id: create_schedule
         run: |
-          echo "🚀 Triggering AWS Inspector scan..."
+          SCHEDULE_NAME="inspector-scan-quarterly"
+          FUNCTION_NAME="inspector-ec2-scanner"
           
-          SCAN_NAME="ec2-scheduled-scan-$(date +%Y%m%d-%H%M%S)"
+          echo "📅 Setting up quarterly EventBridge schedule..."
           
-          # Create scan request
-          SCAN_RESPONSE=$(aws inspector2 create-scan \
-            --scan-name "$SCAN_NAME" \
-            --scan-type "${{ env.SCAN_TYPE }}" \
-            --resources resourceIds="${{ steps.discover_instances.outputs.instance_ids }}" \
-            --output json)
-          
-          SCAN_ID=$(echo $SCAN_RESPONSE | jq -r '.scanId')
-          
-          if [ "$SCAN_ID" = "null" ] || [ -z "$SCAN_ID" ]; then
-            echo "❌ Failed to create scan"
-            echo "Response: $SCAN_RESPONSE"
-            exit 1
+          # Check if rule already exists
+          if aws events describe-rule --name $SCHEDULE_NAME 2>/dev/null; then
+            echo "ℹ︎ Quarterly schedule already exists: $SCHEDULE_NAME"
+          else
+            echo "🆕 Creating quarterly schedule (auto-enabled)..."
+            
+            # Get Lambda function ARN
+            LAMBDA_ARN=$(aws lambda get-function --function-name $FUNCTION_NAME --query 'Configuration.FunctionArn' --output text)
+            
+            # Create schedule (quarterly: January, April, July, October at 2 AM UTC)
+            aws events put-rule \
+              --name $SCHEDULE_NAME \
+              --schedule-expression "cron(0 2 1 1,4,7,10 ? *)" \
+              --description "Quarterly AWS Inspector EC2 scan - staging (AUTO)" \
+              --state ENABLED
+            
+            # Add Lambda target
+            aws events put-targets \
+              --rule $SCHEDULE_NAME \
+              --targets "Id"="1","Arn"="$LAMBDA_ARN"
+            
+            # Add Lambda permission for EventBridge
+            aws lambda add-permission \
+              --function-name $FUNCTION_NAME \
+              --statement-id allow-eventbridge-quarterly \
+              --action lambda:InvokeFunction \
+              --principal events.amazonaws.com \
+              --source-arn "arn:aws:events:${{ env.AWS_REGION }}:$(aws sts get-caller-identity --query Account --output text):rule/$SCHEDULE_NAME" \
+              2>/dev/null || echo "Permission already exists"
+            
+            echo "✅ Quarterly schedule created (ENABLED): $SCHEDULE_NAME"
           fi
           
-          echo "✅ Scan created successfully"
-          echo "📋 Scan ID: $SCAN_ID"
-          echo "📋 Scan Name: $SCAN_NAME"
-          echo "📋 Scan Type: ${{ env.SCAN_TYPE }}"
-          
-          echo "scan_id=$SCAN_ID" >> $GITHUB_OUTPUT
-          echo "scan_name=$SCAN_NAME" >> $GITHUB_OUTPUT
+          echo "schedule_name=$SCHEDULE_NAME" >> $GITHUB_OUTPUT
 
-      - name: Monitor Scan Progress
-        id: monitor_scan
+      - name: Test Lambda Function
+        id: test_function
         run: |
-          echo "⏳ Monitoring scan progress..."
+          echo "🧪 Testing Lambda function..."
           
-          SCAN_ID="${{ steps.trigger_scan.outputs.scan_id }}"
-          MAX_ATTEMPTS=60  # 30 minutes with 30-second intervals
-          ATTEMPT=0
-          
-          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
-            SCAN_STATUS=$(aws inspector2 describe-scans \
-              --scan-ids "$SCAN_ID" \
-              --query 'scans[0].scanStatus.statusCode' \
-              --output text)
-            
-            echo "📊 Scan Status: $SCAN_STATUS (Attempt $((ATTEMPT + 1))/$MAX_ATTEMPTS)"
-            
-            case $SCAN_STATUS in
-              "COMPLETED")
-                echo "✅ Scan completed successfully"
-                break
-                ;;
-              "FAILED")
-                echo "❌ Scan failed"
-                exit 1
-                ;;
-              "CANCELLED")
-                echo "⚠️  Scan was cancelled"
-                exit 1
-                ;;
-              "IN_PROGRESS"|"PENDING")
-                echo "⏳ Scan in progress, waiting..."
-                sleep 30
-                ;;
-              *)
-                echo "❓ Unknown status: $SCAN_STATUS"
-                ;;
-            esac
-            
-            ATTEMPT=$((ATTEMPT + 1))
-          done
-          
-          if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
-            echo "⏰ Scan monitoring timed out"
-            exit 1
-          fi
-
-      - name: Retrieve Scan Results
-        id: get_results
-        run: |
-          echo "📥 Retrieving scan results..."
-          
-          SCAN_ID="${{ steps.trigger_scan.outputs.scan_id }}"
-          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-          
-          # Get scan results
-          aws inspector2 get-scan-results \
-            --scan-id "$SCAN_ID" \
-            --output json > scan_results_${TIMESTAMP}.json
-          
-          # Get findings count
-          FINDINGS_COUNT=$(aws inspector2 list-findings \
-            --filter-criteria scanId="$SCAN_ID" \
-            --query 'length(findings)' \
-            --output text)
-          
-          echo "📊 Total findings: $FINDINGS_COUNT"
-          echo "findings_count=$FINDINGS_COUNT" >> $GITHUB_OUTPUT
-          echo "results_file=scan_results_${TIMESTAMP}.json" >> $GITHUB_OUTPUT
-          
-          # Get severity breakdown
-          echo "📊 Severity Breakdown:"
-          aws inspector2 list-findings \
-            --filter-criteria scanId="$SCAN_ID" \
-            --query 'findings[].{Severity:severity,Title:title}' \
-            --output table > severity_breakdown.txt
-          
-          cat severity_breakdown.txt
-
-      - name: Generate Detailed Report
-        id: generate_report
-        run: |
-          echo "📋 Generating detailed scan report..."
-          
-          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-          REPORT_FILE="inspector_scan_report_${TIMESTAMP}.json"
-          
-          # Create comprehensive report
-          cat > $REPORT_FILE << EOF
+          # Create test event
+          cat > test-event.json << 'EOF'
           {
-            "scan_metadata": {
-              "scan_id": "${{ steps.trigger_scan.outputs.scan_id }}",
-              "scan_name": "${{ steps.trigger_scan.outputs.scan_name }}",
-              "scan_type": "${{ env.SCAN_TYPE }}",
-              "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-              "workflow_run_id": "${{ github.run_id }}",
-              "triggered_by": "${{ github.event_name }}"
-            },
-            "instance_summary": {
-              "total_instances": "$(echo "${{ steps.discover_instances.outputs.instance_ids }}" | tr ',' '\n' | wc -l)",
-              "scanned_instances": "${{ steps.discover_instances.outputs.instance_ids }}",
-              "covered_instances": "${{ steps.check_coverage.outputs.covered_instances }}",
-              "uncovered_instances": "${{ steps.check_coverage.outputs.uncovered_instances }}"
-            },
-            "findings_summary": {
-              "total_findings": "${{ steps.get_results.outputs.findings_count }}"
-            }
+            "source": "test",
+            "detail-type": "Manual Test",
+            "detail": {}
           }
           EOF
           
-          # Append detailed findings
-          echo "," >> $REPORT_FILE
-          echo '"detailed_findings":' >> $REPORT_FILE
-          aws inspector2 list-findings \
-            --filter-criteria scanId="${{ steps.trigger_scan.outputs.scan_id }}" \
-            --output json >> $REPORT_FILE
-          echo "}" >> $REPORT_FILE
+          # Invoke function (async to avoid timeout)
+          aws lambda invoke \
+            --function-name inspector-ec2-scanner \
+            --invocation-type Event \
+            --payload file://test-event.json \
+            response.json
           
-          echo "report_file=$REPORT_FILE" >> $GITHUB_OUTPUT
-          echo "✅ Report generated: $REPORT_FILE"
+          echo "✅ Test invocation sent (async)"
+          echo "Check CloudWatch logs for results"
 
-      - name: Upload Scan Artifacts
+      - name: Upload Deployment Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: inspector-scan-results-${{ github.run_id }}
+          name: ${{ env.LAMBDA_NAME }}
           path: |
-            scan_results_*.json
-            inspector_scan_report_*.json
-            instance_details.txt
-            severity_breakdown.txt
-          retention-days: 90
+            ${{ steps.create_package.outputs.package_name }}
+          retention-days: 30
 
-      - name: Send Results Notification
+      - name: Deployment Summary
+        run: |
+          echo "🎉 Deployment completed successfully!"
+          echo ""
+          echo "📋 Deployment Summary:"
+          echo "Function Name: ${{ env.FUNCTION_NAME }}"
+          echo "Environment: ${{ env.LAMBDA_NAME }}"
+          echo "Runtime: ${{ env.LAMBDA_RUNTIME }}"
+          echo "Memory: ${{ env.LAMBDA_MEMORY }}MB"
+          echo "Timeout: ${{ env.LAMBDA_TIMEOUT }}s"
+          echo "Quarterly Schedule: ${{ steps.create_schedule.outputs.schedule_name }}"
+          echo ""
+          echo "🔗 Next Steps:"
+          echo "1. Verify SNS topic ARN is correct"
+          echo "2. Test function manually: aws lambda invoke --function-name ${{ env.FUNCTION_NAME }}"
+          echo "3. Check CloudWatch logs for execution results"
+          echo "4. Enable monthly schedule if needed"
+          echo ""
+          echo "📊 CloudWatch Logs: /aws/lambda/${{ env.FUNCTION_NAME }}"
+
+      - name: Cleanup
         if: always()
         run: |
-          echo "📧 Preparing notification..."
-          
-          STATUS="SUCCESS"
-          if [ "${{ job.status }}" != "success" ]; then
-            STATUS="FAILED"
-          fi
-          
-          FINDINGS_COUNT="${{ steps.get_results.outputs.findings_count || 'N/A' }}"
-          INSTANCE_COUNT=$(echo "${{ steps.discover_instances.outputs.instance_ids }}" | tr ',' '\n' | wc -l)
-          
-          echo "📋 Scan Summary:"
-          echo "Status: $STATUS"
-          echo "Instances Scanned: $INSTANCE_COUNT"
-          echo "Findings: $FINDINGS_COUNT"
-          echo "Scan ID: ${{ steps.trigger_scan.outputs.scan_id }}"
-          echo "Report: ${{ steps.generate_report.outputs.report_file }}"
-          
-          # Here you could add Slack notification or SNS publishing
-          # Example for future Slack integration:
-          # curl -X POST -H 'Content-type: application/json' \
-          #   --data '{"text":"AWS Inspector EC2 Scan Complete\nStatus: '$STATUS'\nFindings: '$FINDINGS_COUNT'"}' \
-          #   ${{ secrets.SLACK_WEBHOOK_URL }}
-
-      - name: Cleanup Old Scans
-        if: always()
-        run: |
-          echo "🧹 Cleaning up old scan data..."
-          
-          # List scans older than 90 days
-          CUTOFF_DATE=$(date -d '90 days ago' +%Y-%m-%d)
-          
-          OLD_SCANS=$(aws inspector2 list-scans \
-            --query "scans[?createdAt<'${CUTOFF_DATE}'].scanId" \
-            --output text)
-          
-          if [ -n "$OLD_SCANS" ] && [ "$OLD_SCANS" != "None" ]; then
-            echo "🗑️  Found old scans to cleanup: $OLD_SCANS"
-            # Note: Add actual cleanup logic here if Inspector supports scan deletion
-          else
-            echo "✅ No old scans found for cleanup"
-          fi
+          echo "🧹 Cleaning up temporary files..."
+          rm -f ${{ steps.create_package.outputs.package_name }}
+          rm -f test-event.json response.json
+          rm -rf lambda-package/
