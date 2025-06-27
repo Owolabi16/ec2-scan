@@ -1,4 +1,4 @@
-name: Deploy AWS Inspector Lambda Function.
+name: Deploy AWS Inspector Lambda Function
 
 on:
   push:
