@@ -180,6 +180,10 @@ jobs:
             aws lambda update-function-code \
               --function-name $FUNCTION_NAME \
               --zip-file fileb://$PACKAGE_NAME
+
+            # Wait for code update to complete
+            echo "⏳ Waiting for code update to complete..."
+            aws lambda wait function-updated --function-name $FUNCTION_NAME  
             
             aws lambda update-function-configuration \
               --function-name $FUNCTION_NAME \
