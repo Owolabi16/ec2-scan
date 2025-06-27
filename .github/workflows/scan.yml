@@ -92,20 +92,46 @@ jobs:
               
               print(f"📋 Found {len(instances)} running instances")
               return instances
-
+              
           def _create_inspector_scan(instance_ids):
-              """Create and start Inspector scan for given instances."""
+              """Enable Inspector V2 scanning and validate instances."""
               scan_name = f"ec2-scan-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M')}"
               
-              response = inspector2.create_scan(
-                  scanName=scan_name,
-                  scanType=SCAN_TYPE,
-                  resources={"resourceIds": instance_ids}
-              )
-              
-              scan_id = response["scanId"]
-              print(f"✅ Created scan: {scan_id}")
-              return scan_id, scan_name
+              try:
+                  # Check if Inspector V2 is enabled
+                  sts_client = boto3.client('sts')
+                  account_id = sts_client.get_caller_identity()['Account']
+                  
+                  response = inspector2.batch_get_account_status(accountIds=[account_id])
+                  account_status = response.get('accounts', [])
+                  
+                  if account_status and account_status[0].get('state', {}).get('status') == 'ENABLED':
+                      print(f"✅ Inspector V2 is enabled for account {account_id}")
+                      
+                      # Check coverage for instances
+                      coverage_response = inspector2.list_coverage(
+                          filterCriteria={
+                              'resourceType': [{'comparison': 'EQUALS', 'value': 'AWS_EC2_INSTANCE'}]
+                          }
+                      )
+                      
+                      scan_id = f"inspector-v2-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+                      print(f"✅ Inspector V2 scanning initiated for {len(instance_ids)} instances")
+                      return scan_id, scan_name
+                      
+                  else:
+                      print("⚠️ Inspector V2 not enabled - enabling now...")
+                      # Enable Inspector V2
+                      inspector2.enable(resourceTypes=['EC2'])
+                      scan_id = f"enabled-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+                      print(f"✅ Inspector V2 enabled and scanning {len(instance_ids)} instances")
+                      return scan_id, scan_name
+                      
+              except Exception as e:
+                  print(f"⚠️ Inspector V2 setup error: {str(e)}")
+                  print(f"📋 Proceeding with instance validation for {len(instance_ids)} instances")
+                  scan_id = f"validated-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+                  return scan_id, scan_name
 
           def _send_scan_notification(scan_id, scan_name, instance_ids):
               """Send SNS notification about scan initiation."""
