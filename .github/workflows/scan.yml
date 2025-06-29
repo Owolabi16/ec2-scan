@@ -44,27 +44,18 @@ jobs:
           # Create deployment directory
           mkdir -p lambda-package
           
-          # Create requirements.txt for wkhtmltopdf
+          # Create requirements.txt for PDF generation
           cat > requirements.txt << 'DEPS'
-          pdfkit==1.0.0
+          weasyprint==60.2
           DEPS
           
           # Install dependencies
           pip install -r requirements.txt -t lambda-package/
           
-          # Download wkhtmltopdf binary for Lambda
-          cd lambda-package
-          curl -L https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6-1/wkhtmltox_0.12.6-1.centos7.x86_64.rpm -o wkhtmltopdf.rpm
-          rpm2cpio wkhtmltopdf.rpm | cpio -idmv
-          mv usr/local/bin/wkhtmltopdf ./
-          rm -rf usr wkhtmltopdf.rpm
-          cd ..
-          
           # Create the Python script inline
           cat > lambda-package/lambda_function.py << 'EOF'
-          import json, boto3, os, tempfile
+          import json, boto3, os
           from datetime import datetime, timezone
-          import subprocess
 
           SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
           SCAN_TYPE = os.environ.get("SCAN_TYPE", "PACKAGE_VULNERABILITY")
@@ -277,39 +268,15 @@ jobs:
               return html_content
 
           def _convert_html_to_pdf(html_content, scan_name):
-              """Convert HTML to PDF using wkhtmltopdf (exact same logic as example)."""
-              # Create temporary files
-              with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False) as html_file:
-                  html_file.write(html_content)
-                  html_path = html_file.name
-              
-              pdf_path = f"/tmp/{scan_name}.pdf"
-              
+              """Convert HTML to PDF using weasyprint (Python-native, no external binaries)."""
               try:
-                  # Use wkhtmltopdf binary (same as example workflow)
-                  wkhtmltopdf_path = os.path.join(os.path.dirname(__file__), 'wkhtmltopdf')
-                  cmd = [wkhtmltopdf_path, '--page-size', 'A4', '--margin-top', '0.75in', '--margin-bottom', '0.75in', 
-                         '--margin-left', '0.75in', '--margin-right', '0.75in', html_path, pdf_path]
-                  
-                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-                  
-                  if result.returncode != 0:
-                      raise Exception(f"wkhtmltopdf failed: {result.stderr}")
-                  
-                  # Read PDF data
-                  with open(pdf_path, 'rb') as pdf_file:
-                      pdf_data = pdf_file.read()
-                  
+                  from weasyprint import HTML
+                  pdf_data = HTML(string=html_content).write_pdf()
                   print(f"Generated PDF report: {len(pdf_data)} bytes")
                   return pdf_data
-                  
-              finally:
-                  # Cleanup
-                  try:
-                      os.unlink(html_path)
-                      os.unlink(pdf_path)
-                  except:
-                      pass
+              except Exception as e:
+                  print(f"PDF generation failed: {str(e)}")
+                  raise e  # Fail hard, no fallback (as requested)
 
           def _upload_and_notify(pdf_data, scan_name, scan_id, instance_ids, name_map):
               """Upload PDF report and send comprehensive notification."""
