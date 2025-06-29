@@ -289,7 +289,7 @@ jobs:
 
               html_content = f"""<!DOCTYPE html>
               <html><head><meta charset="UTF-8"><title>AWS Inspector Report</title>
-              <style>{css_styles}</style></head><body>"""
+              <style>{css_styles}</style></head>
               <body>
                   <div class="header">
                       <h1> AWS Inspector Security Report</h1>
