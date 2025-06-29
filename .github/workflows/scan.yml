@@ -339,7 +339,7 @@ jobs:
                   </div>
                   
                   <div class="findings-section">
-                      <h2 class="findings-header">🔍 Priority Security Issues (Top {len(priority_findings)})</h2>
+                      <h2 class="findings-header"> Priority Security Issues (Top {len(priority_findings)})</h2>
                       <div class="findings-content">
                           {priority_findings_html if priority_findings else '<p style="text-align: center; color: #28a745; font-size: 16px;">🎉 No critical security issues detected!</p>'}
                       </div>
