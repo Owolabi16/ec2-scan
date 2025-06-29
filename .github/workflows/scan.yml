@@ -43,14 +43,6 @@ jobs:
           
           # Create deployment directory
           mkdir -p lambda-package
-
-          # Create requirements.txt
-          cat > requirements.txt << 'DEPS'
-          weasyprint==60.2
-          DEPS
-          
-          # Install dependencies
-          pip install -r requirements.txt -t lambda-package/
           
           # Create the Python script inline
           cat > lambda-package/lambda_function.py << 'EOF'
@@ -356,16 +348,9 @@ jobs:
               """
               
               # Convert HTML to PDF with fallback
-              try:
-                  from weasyprint import HTML
-                  pdf_data = HTML(string=html_content).write_pdf()
-                  print(f" Generated clean PDF report: {len(pdf_data)} bytes")
-                  return pdf_data
-              except Exception as e:
-                  print(f" PDF generation failed, using HTML fallback: {str(e)}")
-                  # Return HTML as base64 for manual conversion
-                  html_bytes = html_content.encode('utf-8')
-                  return base64.b64encode(html_bytes).decode('utf-8')
+              print(f"Generating HTML report: {len(html_content)} characters")
+              html_bytes = html_content.encode('utf-8')
+              return base64.b64encode(html_bytes).decode('utf-8')
 
           def _send_scan_notification(scan_id, scan_name, instance_ids, pdf_url=None):
               """Send enhanced notification with PDF link."""
