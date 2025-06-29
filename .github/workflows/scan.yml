@@ -58,89 +58,177 @@ jobs:
           ec2 = boto3.client("ec2")
           inspector2 = boto3.client("inspector2")
 
-          def _get_instances_and_findings():
-              """Get EC2 instances and their Inspector findings."""
-              # Discover instances
+          def _get_instances_with_names():
+              """Get EC2 instances and their names in one call."""
               filters = [{"Name": "instance-state-name", "Values": ["running"]}]
               if ENVIRONMENT_FILTER:
                   filters.append({"Name": "tag:Environment", "Values": [ENVIRONMENT_FILTER]})
               
               resp = ec2.describe_instances(Filters=filters)
-              instances = []
+              instances, name_map = [], {}
               
               for reservation in resp.get("Reservations", []):
                   for instance in reservation.get("Instances", []):
-                      instances.append(instance["InstanceId"])
+                      iid = instance["InstanceId"]
+                      instances.append(iid)
+                      tags = instance.get("Tags", [])
+                      name_map[iid] = next((t["Value"] for t in tags if t["Key"] == "Name"), "Unnamed Instance")
               
               print(f"Found {len(instances)} running instances")
-              
-              # Get findings
+              return instances, name_map
+
+          def _get_filtered_findings(instance_ids):
+              """Retrieve and filter SBOM findings in one operation."""
               try:
                   findings_response = inspector2.list_findings(
-                      filterCriteria={'resourceId': [{'comparison': 'EQUALS', 'value': iid} for iid in instances]},
+                      filterCriteria={'resourceId': [{'comparison': 'EQUALS', 'value': iid} for iid in instance_ids]},
                       maxResults=50
                   )
                   findings = findings_response.get('findings', [])
-                  print(f"Retrieved {len(findings)} findings")
+                  print(f"Retrieved {len(findings)} findings for SBOM report")
               except Exception as e:
-                  print(f"Error retrieving findings: {str(e)}")
+                  print(f"Error retrieving Inspector data: {str(e)}")
                   findings = []
               
-              return instances, findings
+              # Filter and prioritize in one step
+              by_severity = {
+                  'CRITICAL': [f for f in findings if f.get('severity') == 'CRITICAL'],
+                  'HIGH': [f for f in findings if f.get('severity') == 'HIGH'],
+                  'MEDIUM': [f for f in findings if f.get('severity') == 'MEDIUM'],
+                  'LOW': [f for f in findings if f.get('severity') == 'LOW']
+              }
+              
+              # Combine priority findings (max 8 total: 4 critical + 3 high + 1 medium)
+              priority_findings = by_severity['CRITICAL'][:4] + by_severity['HIGH'][:3] + by_severity['MEDIUM'][:1]
+              
+              return {
+                  'findings': findings,
+                  'priority_findings': priority_findings,
+                  'total_critical': len(by_severity['CRITICAL']),
+                  'total_high': len(by_severity['HIGH']),
+                  'total_medium': len(by_severity['MEDIUM']),
+                  'total_low': len(by_severity['LOW']),
+                  'total_findings': len(findings),
+                  'instance_count': len(instance_ids)
+              }
 
-          def _generate_report(scan_id, instances, findings):
-              """Generate simple HTML report."""
-              # Count findings by severity
-              critical = len([f for f in findings if f.get('severity') == 'CRITICAL'])
-              high = len([f for f in findings if f.get('severity') == 'HIGH'])
-              medium = len([f for f in findings if f.get('severity') == 'MEDIUM'])
-              low = len([f for f in findings if f.get('severity') == 'LOW'])
+          def _generate_professional_report(scan_id, scan_name, instance_ids, name_map, filtered_data):
+              """Generate comprehensive HTML report with executive styling."""
+              # Get instance names for summary
+              instance_names = [name_map.get(iid, 'Unnamed') for iid in instance_ids[:3]]
+              if len(instance_ids) > 3:
+                  instance_names.append(f"... and {len(instance_ids)-3} more")
               
-              # Risk level
-              risk = "HIGH" if critical > 0 else "MEDIUM" if high > 0 else "LOW"
-              risk_color = '#dc3545' if risk == 'HIGH' else '#fd7e14' if risk == 'MEDIUM' else '#28a745'
+              # Risk assessment
+              risk_level = "HIGH RISK" if filtered_data['total_critical'] > 0 else \
+                          "MEDIUM RISK" if filtered_data['total_high'] > 0 else \
+                          "LOW RISK" if filtered_data['total_medium'] > 0 else \
+                          "MINIMAL RISK"
               
-              # Top findings
-              top_findings = sorted([f for f in findings if f.get('severity') in ['CRITICAL', 'HIGH']], 
-                                  key=lambda x: {'CRITICAL': 0, 'HIGH': 1}.get(x.get('severity'), 2))[:5]
-              
+              # Generate findings HTML
               findings_html = ""
-              for i, finding in enumerate(top_findings, 1):
-                  title = finding.get('title', 'Security Issue')[:50]
+              for i, finding in enumerate(filtered_data['priority_findings'], 1):
                   severity = finding.get('severity', 'UNKNOWN')
-                  findings_html += f"<li><strong>{severity}:</strong> {title}</li>"
+                  color = {'CRITICAL': '#dc3545', 'HIGH': '#fd7e14', 'MEDIUM': '#ffc107', 'LOW': '#28a745'}.get(severity, '#6c757d')
+                  title = finding.get('title', 'Security Issue')[:50]
+                  vuln_id = finding.get('packageVulnerabilityDetails', {}).get('vulnerabilityId', '')
+                  resource = finding.get('resources', [{}])[0].get('id', 'Unknown')
+                  description = finding.get("description", "No description available")[:120]
+                  
+                  findings_html += f'''
+                  <div style="margin: 10px 0; padding: 15px; border-left: 5px solid {color}; background: #f8f9fa; border-radius: 5px;">
+                      <div style="display: flex; justify-content: space-between; align-items: center;">
+                          <h4 style="margin: 0; color: #333;">{i}. {title}</h4>
+                          <span style="background: {color}; color: white; padding: 4px 8px; border-radius: 3px; font-size: 12px; font-weight: bold;">{severity}</span>
+                      </div>
+                      <p style="margin: 8px 0 4px 0; color: #666;"><strong>Affected:</strong> {resource}</p>
+                      {f'<p style="margin: 4px 0; color: #666;"><strong>CVE:</strong> {vuln_id}</p>' if vuln_id else ''}
+                      <p style="margin: 4px 0; color: #555; font-size: 14px;">{description}...</p>
+                  </div>'''
               
-              html = f"""<!DOCTYPE html>
-          <html><head><title>AWS Inspector Report</title>
-          <style>body{{font-family:Arial;margin:20px;}}h1{{color:#2a5298;}}.risk{{color:{risk_color};font-weight:bold;}}</style>
-          </head><body>
-          <h1>AWS Inspector Security Report</h1>
-          <p><strong>Scan ID:</strong> {scan_id}</p>
-          <p><strong>Date:</strong> {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</p>
-          <p><strong>Instances Scanned:</strong> {len(instances)}</p>
-          <p><strong>Risk Level:</strong> <span class="risk">{risk} RISK</span></p>
-
-          <h2>Findings Summary</h2>
-          <ul>
-          <li>Critical: {critical}</li>
-          <li>High: {high}</li>
-          <li>Medium: {medium}</li>
-          <li>Low: {low}</li>
-          </ul>
-
-          <h2>Top Priority Issues</h2>
-          <ul>{findings_html if findings_html else '<li>No critical issues detected</li>'}</ul>
-
-          <p><em>Report generated by AWS Inspector V2</em></p>
-          </body></html>"""
+              # Action recommendation
+              action_needed = "Immediate action required" if filtered_data['total_critical'] > 0 else \
+                            "Review and plan remediation" if filtered_data['total_high'] > 0 else \
+                            "Monitor and address when convenient" if filtered_data['total_medium'] > 0 else \
+                            "No immediate action needed"
               
-              print(f"Generated report: {len(html)} characters")
-              return base64.b64encode(html.encode('utf-8')).decode('utf-8')
-
-          def _upload_and_notify(report_data, scan_id, instance_count):
-              """Upload report to S3 and send notification."""
-              scan_name = f"ec2-scan-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M')}"
+              next_steps = "1. Address critical issues immediately 2. Review high-priority items 3. Schedule medium-priority fixes" if \
+                          filtered_data['total_critical'] + filtered_data['total_high'] > 0 else "Continue monitoring. No urgent action required."
               
+              # Complete HTML report
+              html_content = f'''<!DOCTYPE html>
+          <html><head><meta charset="UTF-8"><title>AWS Inspector Report</title>
+          <style>
+          body {{ font-family: Arial, sans-serif; margin: 20px; line-height: 1.6; color: #333; }}
+          .header {{ background: #2a5298; color: white; padding: 20px; border-radius: 8px; text-align: center; margin-bottom: 20px; }}
+          .summary-box {{ background: #f8f9fa; padding: 15px; border-radius: 5px; margin: 10px 0; }}
+          .metrics {{ display: flex; gap: 10px; margin: 15px 0; }}
+          .metric {{ text-align: center; padding: 10px; background: white; border: 2px solid #ddd; border-radius: 5px; flex: 1; }}
+          .critical {{ border-color: #dc3545; }} .high {{ border-color: #fd7e14; }} .medium {{ border-color: #ffc107; }}
+          </style></head>
+          <body>
+          <div class="header">
+              <h1>AWS Inspector Security Report</h1>
+              <p>Executive Summary - Priority Issues Only</p>
+          </div>
+
+          <div class="summary-grid">
+              <div class="summary-box">
+                  <h3 style="margin: 0 0 15px 0; color: #495057;">Scan Details</h3>
+                  <table>
+                      <tr><td style="background: #f8f9fa; font-weight: 600; width: 140px; padding: 8px 12px; border-bottom: 1px solid #e9ecef;">Scan ID:</td><td style="padding: 8px 12px; border-bottom: 1px solid #e9ecef;">{scan_id}</td></tr>
+                      <tr><td style="background: #f8f9fa; font-weight: 600; width: 140px; padding: 8px 12px; border-bottom: 1px solid #e9ecef;">Date:</td><td style="padding: 8px 12px; border-bottom: 1px solid #e9ecef;">{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</td></tr>
+                      <tr><td style="background: #f8f9fa; font-weight: 600; width: 140px; padding: 8px 12px; border-bottom: 1px solid #e9ecef;">Instances:</td><td style="padding: 8px 12px; border-bottom: 1px solid #e9ecef;">{len(instance_ids)} ({', '.join(instance_names)})</td></tr>
+                      <tr><td style="background: #f8f9fa; font-weight: 600; width: 140px; padding: 8px 12px; border-bottom: 1px solid #e9ecef;">Total Issues:</td><td style="padding: 8px 12px; border-bottom: 1px solid #e9ecef;">{filtered_data['total_findings']}</td></tr>
+                  </table>
+              </div>
+              
+              <div class="summary-box">
+                  <h3 style="margin: 0 0 15px 0; color: #495057;">Risk Assessment</h3>
+                  <div style="text-align: center; font-size: 18px; font-weight: bold; margin: 15px 0; padding: 15px; border-radius: 8px; background: #f8f9fa;">{risk_level}</div>
+                  <p style="font-size: 14px; text-align: center; margin: 10px 0 0 0; color: #666;">{action_needed}</p>
+              </div>
+          </div>
+
+          <div class="metrics">
+              <div class="metric critical">
+                  <h3 style="font-size: 24px; font-weight: bold; margin: 0; color: #dc3545;">{filtered_data['total_critical']}</h3>
+                  <p style="font-size: 12px; color: #666; margin: 5px 0 0 0;">Critical</p>
+              </div>
+              <div class="metric high">
+                  <h3 style="font-size: 24px; font-weight: bold; margin: 0; color: #fd7e14;">{filtered_data['total_high']}</h3>
+                  <p style="font-size: 12px; color: #666; margin: 5px 0 0 0;">High</p>
+              </div>
+              <div class="metric medium">
+                  <h3 style="font-size: 24px; font-weight: bold; margin: 0; color: #ffc107;">{filtered_data['total_medium']}</h3>
+                  <p style="font-size: 12px; color: #666; margin: 5px 0 0 0;">Medium</p>
+              </div>
+              <div class="metric">
+                  <h3 style="font-size: 24px; font-weight: bold; margin: 0; color: #28a745;">{filtered_data['total_low']}</h3>
+                  <p style="font-size: 12px; color: #666; margin: 5px 0 0 0;">Low</p>
+              </div>
+          </div>
+
+          <div style="margin-top: 25px;">
+              <h2 style="background: #343a40; color: white; padding: 15px; border-radius: 8px 8px 0 0; margin: 0;">Priority Security Issues (Top {len(filtered_data['priority_findings'])})</h2>
+              <div style="border: 1px solid #343a40; border-top: none; border-radius: 0 0 8px 8px; padding: 20px;">
+                  {findings_html if findings_html else '<p style="text-align: center; color: #28a745; font-size: 16px;">No critical security issues detected!</p>'}
+              </div>
+          </div>
+
+          <div style="margin-top: 30px; padding: 20px; background: #f8f9fa; border-radius: 8px; text-align: center; border: 1px solid #e9ecef;">
+              <p><strong>Next Steps:</strong> {next_steps}</p>
+              <p style="font-size: 12px; color: #666; margin-top: 10px;">
+                  Report generated by AWS Inspector V2 | Scan ID: {scan_id} | This report shows only the most critical findings for executive review.
+              </p>
+          </div>
+          </body></html>'''
+              
+              print(f"Generated HTML report: {len(html_content)} characters")
+              return base64.b64encode(html_content.encode('utf-8')).decode('utf-8')
+
+          def _upload_and_notify(pdf_data, scan_name, scan_id, instance_ids, name_map):
+              """Upload report and send comprehensive notification."""
               # Upload to S3
               try:
                   s3_client = boto3.client('s3')
@@ -148,65 +236,86 @@ jobs:
                   s3_key = f"inspector-reports/{timestamp}/{scan_name}.pdf"
                   
                   s3_client.put_object(
-                      Bucket=REPORTS_BUCKET,
-                      Key=s3_key,
-                      Body=report_data,
-                      ContentType='application/pdf'
+                      Bucket=REPORTS_BUCKET, Key=s3_key, Body=pdf_data, ContentType='application/pdf',
+                      Metadata={'scan-name': scan_name, 'generated-at': datetime.now(timezone.utc).isoformat()}
                   )
                   
-                  pdf_url = s3_client.generate_presigned_url(
-                      'get_object',
-                      Params={'Bucket': REPORTS_BUCKET, 'Key': s3_key},
-                      ExpiresIn=86400
-                  )
-                  print(f"Report uploaded: s3://{REPORTS_BUCKET}/{s3_key}")
+                  pdf_url = s3_client.generate_presigned_url('get_object', 
+                      Params={'Bucket': REPORTS_BUCKET, 'Key': s3_key}, ExpiresIn=86400)
+                  print(f"PDF uploaded to S3: s3://{REPORTS_BUCKET}/{s3_key}")
               except Exception as e:
-                  print(f"Upload failed: {str(e)}")
+                  print(f"Could not upload PDF to S3: {str(e)}")
                   pdf_url = None
               
               # Send notification
-              message = f"""AWS Inspector V2 scan completed.
+              instance_list = [f"{name_map[iid]}: {iid}" for iid in instance_ids]
+              pdf_section = f"\n\nSBOM PDF Report: {pdf_url}" if pdf_url else "\n\nPDF report generation in progress..."
+              
+              message = f"""AWS Inspector V2 scan completed with SBOM analysis.
 
           Scan: {scan_name}
           ID: {scan_id}
-          Instances: {instance_count}
-          Report: {pdf_url if pdf_url else 'Upload failed'}
+          Type: {SCAN_TYPE}
+          Instances: {len(instance_ids)}
 
-          Check AWS Console for details."""
+          Scanned Instances:
+          {chr(10).join(instance_list)}
+          {pdf_section}
+
+          Status available in AWS Console."""
               
-              sns.publish(
-                  TopicArn=SNS_TOPIC_ARN,
-                  Subject=f"Inspector Report - {scan_name}",
-                  Message=message
-              )
-              print("Notification sent")
+              sns.publish(TopicArn=SNS_TOPIC_ARN, Subject=f"Inspector SBOM Report - {scan_name}", Message=message)
+              print("Enhanced notification sent with PDF link")
+              return pdf_url
 
           def lambda_handler(event, context):
-              """Main Lambda handler."""
-              print("Starting Inspector scan...")
+              """Main Lambda handler with complete SBOM processing."""
+              print("▶︎ Received event:", json.dumps(event))
               
               try:
-                  # Get instances and findings
-                  instances, findings = _get_instances_and_findings()
-                  if not instances:
-                      print("No instances found")
+                  # Get instances and names
+                  instance_ids, name_map = _get_instances_with_names()
+                  if not instance_ids:
+                      print("No EC2 instances found")
                       return {"statusCode": 204, "body": "No instances to scan"}
                   
-                  # Generate report
+                  # Check Inspector V2 status
+                  sts_client = boto3.client('sts')
+                  account_id = sts_client.get_caller_identity()['Account']
+                  response = inspector2.batch_get_account_status(accountIds=[account_id])
+                  account_status = response.get('accounts', [])
+                  
+                  if not (account_status and account_status[0].get('state', {}).get('status') == 'ENABLED'):
+                      print("Inspector V2 not enabled - enabling now...")
+                      inspector2.enable(resourceTypes=['EC2'])
+                      scan_id = f"enabled-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+                      print(f"Inspector V2 enabled and scanning {len(instance_ids)} instances")
+                      return {"statusCode": 200, "body": f"Inspector enabled: {scan_id}"}
+                  
+                  print(f"Inspector V2 is enabled for account {account_id}")
+                  
+                  # Get filtered findings and generate report
+                  print("Retrieving SBOM and findings data...")
+                  filtered_data = _get_filtered_findings(instance_ids)
+                  
+                  print("Generating clean, filtered PDF report...")
                   scan_id = f"inspector-v2-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
-                  report = _generate_report(scan_id, instances, findings)
+                  scan_name = f"ec2-scan-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M')}"
+                  pdf_data = _generate_professional_report(scan_id, scan_name, instance_ids, name_map, filtered_data)
                   
                   # Upload and notify
-                  _upload_and_notify(report, scan_id, len(instances))
+                  pdf_url = _upload_and_notify(pdf_data, scan_name, scan_id, instance_ids, name_map)
                   
-                  print("Scan completed successfully")
-                  return {"statusCode": 200, "body": f"Scan completed: {scan_id}"}
+                  print("Inspector V2 scanning completed with PDF report")
+                  print(f"PDF report generated: {len(pdf_data)} bytes")
+                  print("Scan initiated successfully")
+                  return {"statusCode": 200, "body": f"Scan started: {scan_id}"}
                   
               except Exception as e:
                   print(f"Error: {str(e)}")
                   return {"statusCode": 500, "body": f"Failed: {str(e)}"}
           EOF
-          
+
           # Create ZIP package
           cd lambda-package
           zip -r ../$PACKAGE_NAME .
