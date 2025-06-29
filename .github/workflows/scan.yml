@@ -2,7 +2,7 @@ name: Deploy AWS Inspector Lambda Function
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   
   workflow_dispatch:
 
