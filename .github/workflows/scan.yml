@@ -429,9 +429,9 @@ jobs:
               """Upload PDF report and send comprehensive notification."""
               # Upload to S3
               try:
-                  s3_client = boto3.client('s3')
-                  timestamp = datetime.now(timezone.utc).strftime('%Y/%m/%d')
-                  s3_key = f"inspector-reports/{timestamp}/{scan_name}.pdf"
+              
+                  year_month = datetime.now(timezone.utc).strftime('%Y-%m')
+                  s3_key = f"security-reports/{ENVIRONMENT_FILTER}/{year_month}/inspector-assessment.pdf"
                   
                   s3_client.put_object(
                       Bucket=REPORTS_BUCKET, Key=s3_key, Body=pdf_data, ContentType='application/pdf',
