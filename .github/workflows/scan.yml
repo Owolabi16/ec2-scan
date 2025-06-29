@@ -36,7 +36,7 @@ jobs:
       - name: Create Lambda Deployment Package
         id: create_package
         run: |
-          echo "📦 Creating Lambda deployment package..."
+          echo " Creating Lambda deployment package..."
 
           # Set package name
           PACKAGE_NAME="lambda-deployment.zip"
@@ -99,7 +99,7 @@ jobs:
                   for instance in reservation.get("Instances", []):
                       instances.append(instance["InstanceId"])
               
-              print(f"📋 Found {len(instances)} running instances")
+              print(f" Found {len(instances)} running instances")
               return instances
 
           def _get_sbom_findings(instance_ids):
@@ -113,7 +113,7 @@ jobs:
                   )
                   
                   findings = findings_response.get('findings', [])
-                  print(f"📊 Retrieved {len(findings)} findings for SBOM report")
+                  print(f" Retrieved {len(findings)} findings for SBOM report")
                   
                   return {
                       'findings': findings,
@@ -121,7 +121,7 @@ jobs:
                   }
                   
               except Exception as e:
-                  print(f"⚠️ Error retrieving Inspector data: {str(e)}")
+                  print(f" Error retrieving Inspector data: {str(e)}")
                   return {'findings': [], 'instance_count': len(instance_ids)}
 
           def _upload_pdf_to_s3(pdf_data, scan_name):
@@ -145,11 +145,11 @@ jobs:
                       ExpiresIn=86400
                   )
                   
-                  print(f"✅ PDF uploaded to S3: s3://{REPORTS_BUCKET}/{s3_key}")
+                  print(f" PDF uploaded to S3: s3://{REPORTS_BUCKET}/{s3_key}")
                   return pdf_url
                   
               except Exception as e:
-                  print(f"⚠️ Could not upload PDF to S3: {str(e)}")
+                  print(f" Could not upload PDF to S3: {str(e)}")
                   return None
 
           def _create_inspector_scan(instance_ids):
@@ -164,35 +164,35 @@ jobs:
                   account_status = response.get('accounts', [])
                   
                   if account_status and account_status[0].get('state', {}).get('status') == 'ENABLED':
-                      print(f"✅ Inspector V2 is enabled for account {account_id}")
+                      print(f" Inspector V2 is enabled for account {account_id}")
                       
                       # Get SBOM and findings data
-                      print("📊 Retrieving SBOM and findings data...")
+                      print(" Retrieving SBOM and findings data...")
                       findings_data = _get_sbom_findings(instance_ids)
                       
                       # Generate clean PDF report
-                      print("📄 Generating clean, filtered PDF report...")
+                      print(" Generating clean, filtered PDF report...")
                       pdf_data = _generate_clean_pdf(f"inspector-v2-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}", scan_name, instance_ids, findings_data)
                       
                       # Upload PDF to S3
                       pdf_url = _upload_pdf_to_s3(pdf_data, scan_name)
                       
                       scan_id = f"inspector-v2-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
-                      print(f"✅ Inspector V2 scanning completed with PDF report")
-                      print(f"📄 PDF report generated: {len(pdf_data)} bytes")
+                      print(f" Inspector V2 scanning completed with PDF report")
+                      print(f" PDF report generated: {len(pdf_data)} bytes")
                       
                       return scan_id, scan_name, pdf_url
                       
                   else:
-                      print("⚠️ Inspector V2 not enabled - enabling now...")
+                      print(" Inspector V2 not enabled - enabling now...")
                       inspector2.enable(resourceTypes=['EC2'])
                       scan_id = f"enabled-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
-                      print(f"✅ Inspector V2 enabled and scanning {len(instance_ids)} instances")
+                      print(f" Inspector V2 enabled and scanning {len(instance_ids)} instances")
                       return scan_id, scan_name, None
                       
               except Exception as e:
-                  print(f"⚠️ Inspector V2 setup error: {str(e)}")
-                  print(f"📋 Proceeding with instance validation for {len(instance_ids)} instances")
+                  print(f" Inspector V2 setup error: {str(e)}")
+                  print(f" Proceeding with instance validation for {len(instance_ids)} instances")
                   scan_id = f"validated-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
                   return scan_id, scan_name, None    
 
@@ -239,10 +239,10 @@ jobs:
                   instance_names = [f"Instance {i+1}" for i in range(min(len(instance_ids), 3))]
               
               # Risk assessment
-              risk_level = "🔴 HIGH RISK" if filtered['total_critical'] > 0 else \
-                          "🟠 MEDIUM RISK" if filtered['total_high'] > 0 else \
-                          "🟡 LOW RISK" if filtered['total_medium'] > 0 else \
-                          "🟢 MINIMAL RISK"
+              risk_level = " HIGH RISK" if filtered['total_critical'] > 0 else \
+                          " MEDIUM RISK" if filtered['total_high'] > 0 else \
+                          " LOW RISK" if filtered['total_medium'] > 0 else \
+                          " MINIMAL RISK"
               
               # Generate priority findings HTML (only most important)
               priority_findings_html = ""
@@ -292,13 +292,13 @@ jobs:
               <style>{css_styles}</style></head><body>"""
               <body>
                   <div class="header">
-                      <h1>🛡️ AWS Inspector Security Report</h1>
+                      <h1> AWS Inspector Security Report</h1>
                       <p>Executive Summary - Priority Issues Only</p>
                   </div>
                   
                   <div class="summary-grid">
                       <div class="summary-box">
-                          <h3 style="margin: 0 0 15px 0; color: #495057;">📋 Scan Details</h3>
+                          <h3 style="margin: 0 0 15px 0; color: #495057;"> Scan Details</h3>
                           <table>
                               <tr><td class="label">Scan ID:</td><td>{scan_id}</td></tr>
                               <tr><td class="label">Date:</td><td>{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</td></tr>
@@ -308,7 +308,7 @@ jobs:
                       </div>
                       
                       <div class="summary-box">
-                          <h3 style="margin: 0 0 15px 0; color: #495057;">⚠️ Risk Assessment</h3>
+                          <h3 style="margin: 0 0 15px 0; color: #495057;"> Risk Assessment</h3>
                           <div class="risk-level">{risk_level}</div>
                           <p style="font-size: 14px; text-align: center; margin: 10px 0 0 0; color: #666;">
                               {"Immediate action required" if filtered['total_critical'] > 0 else 
@@ -359,10 +359,10 @@ jobs:
               try:
                   from weasyprint import HTML
                   pdf_data = HTML(string=html_content).write_pdf()
-                  print(f"📄 Generated clean PDF report: {len(pdf_data)} bytes")
+                  print(f" Generated clean PDF report: {len(pdf_data)} bytes")
                   return pdf_data
               except Exception as e:
-                  print(f"⚠️ PDF generation failed, using HTML fallback: {str(e)}")
+                  print(f" PDF generation failed, using HTML fallback: {str(e)}")
                   # Return HTML as base64 for manual conversion
                   html_bytes = html_content.encode('utf-8')
                   return base64.b64encode(html_bytes).decode('utf-8')
