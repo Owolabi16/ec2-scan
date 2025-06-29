@@ -372,7 +372,7 @@ jobs:
               name_map = _get_ec2_name_map(instance_ids)
               instance_list = [f"{name_map[iid]}: {iid}" for iid in instance_ids]
               
-              pdf_section = f"\n\n📄 SBOM PDF Report: {pdf_url}" if pdf_url else "\n\n📄 PDF report generation in progress..."
+              pdf_section = f"\n\n SBOM PDF Report: {pdf_url}" if pdf_url else "\n\n PDF report generation in progress..."
               
               message = f"""AWS Inspector V2 scan completed with SBOM analysis.
 
@@ -392,7 +392,7 @@ jobs:
                   Subject=f"Inspector SBOM Report - {scan_name}",
                   Message=message
               )
-              print("✅ Enhanced notification sent with PDF link")  
+              print(" Enhanced notification sent with PDF link")  
 
           def lambda_handler(event, context):
               """
@@ -419,11 +419,11 @@ jobs:
                   # 3. Send notification with PDF link
                   _send_scan_notification(scan_id, scan_name, ec2_ids, pdf_url)
                   
-                  print("✅ Scan initiated successfully")
+                  print(" Scan initiated successfully")
                   return {"statusCode": 200, "body": f"Scan started: {scan_id}"}
                   
               except Exception as e:
-                  print(f"❌ Error: {str(e)}")
+                  print(f" Error: {str(e)}")
                   return {"statusCode": 500, "body": f"Failed: {str(e)}"}
           EOF
           
@@ -432,7 +432,7 @@ jobs:
           zip -r ../$PACKAGE_NAME .
           cd ..
           
-          echo "✅ Package created: $PACKAGE_NAME"
+          echo " Package created: $PACKAGE_NAME"
 
           echo "package_name=$PACKAGE_NAME" >> $GITHUB_OUTPUT
 
@@ -441,7 +441,7 @@ jobs:
           FUNCTION_NAME="inspector-ec2-scanner"
           PACKAGE_NAME="${{ steps.create_package.outputs.package_name }}"
           
-          echo "🚀 Deploying Lambda function..."
+          echo " Deploying Lambda function..."
           
           if aws lambda get-function --function-name $FUNCTION_NAME 2>/dev/null; then
             echo "🔄 Updating existing function..."
@@ -451,7 +451,7 @@ jobs:
               --zip-file fileb://$PACKAGE_NAME
 
             # Wait for code update to complete
-            echo "⏳ Waiting for code update to complete..."
+            echo " Waiting for code update to complete..."
             aws lambda wait function-updated --function-name $FUNCTION_NAME  
             
             aws lambda update-function-configuration \
@@ -461,7 +461,7 @@ jobs:
               --memory-size ${{ env.LAMBDA_MEMORY }} \
               --environment Variables="{SNS_TOPIC_ARN=${{ secrets.SNS_TOPIC_ARN }},SCAN_TYPE=PACKAGE_VULNERABILITY,ENVIRONMENT_FILTER=staging,REPORTS_BUCKET=${{ secrets.REPORTS_BUCKET }}}"
             
-            echo "✅ Function updated"
+            echo " Function updated"
           else
             echo "🆕 Creating new function..."
             
@@ -476,7 +476,7 @@ jobs:
               --environment Variables="{SNS_TOPIC_ARN=${{ secrets.SNS_TOPIC_ARN }},SCAN_TYPE=PACKAGE_VULNERABILITY,ENVIRONMENT_FILTER=staging,REPORTS_BUCKET=${{ secrets.REPORTS_BUCKET }}}" \
               --description "AWS Inspector V2 EC2 Scanner - staging"
             
-            echo "✅ Function created"
+            echo " Function created"
           fi
 
       - name: Create EventBridge Schedule (Quarterly - Auto)
@@ -485,13 +485,13 @@ jobs:
           SCHEDULE_NAME="inspector-scan-quarterly"
           FUNCTION_NAME="inspector-ec2-scanner"
           
-          echo "📅 Setting up quarterly EventBridge schedule..."
+          echo " Setting up quarterly EventBridge schedule..."
           
           # Check if rule already exists
           if aws events describe-rule --name $SCHEDULE_NAME 2>/dev/null; then
             echo "ℹ︎ Quarterly schedule already exists: $SCHEDULE_NAME"
           else
-            echo "🆕 Creating quarterly schedule (auto-enabled)..."
+            echo " Creating quarterly schedule (auto-enabled)..."
             
             # Get Lambda function ARN
             LAMBDA_ARN=$(aws lambda get-function --function-name $FUNCTION_NAME --query 'Configuration.FunctionArn' --output text)
@@ -517,7 +517,7 @@ jobs:
               --source-arn "arn:aws:events:${{ env.AWS_REGION }}:$(aws sts get-caller-identity --query Account --output text):rule/$SCHEDULE_NAME" \
               2>/dev/null || echo "Permission already exists"
             
-            echo "✅ Quarterly schedule created (ENABLED): $SCHEDULE_NAME"
+            echo " Quarterly schedule created (ENABLED): $SCHEDULE_NAME"
           fi
           
           echo "schedule_name=$SCHEDULE_NAME" >> $GITHUB_OUTPUT
