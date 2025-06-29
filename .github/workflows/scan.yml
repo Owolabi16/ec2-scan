@@ -46,7 +46,7 @@ jobs:
           
           # Create requirements.txt for PDF generation
           cat > requirements.txt << 'DEPS'
-          weasyprint==60.2
+          reportlab==4.0.4
           DEPS
           
           # Install dependencies
@@ -268,15 +268,162 @@ jobs:
               return html_content
 
           def _convert_html_to_pdf(html_content, scan_name):
-              """Convert HTML to PDF using weasyprint (Python-native, no external binaries)."""
+              """Convert HTML to PDF using reportlab (Lambda-compatible, pure Python)."""
               try:
-                  from weasyprint import HTML
-                  pdf_data = HTML(string=html_content).write_pdf()
+                  from reportlab.lib.pagesizes import letter, A4
+                  from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+                  from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+                  from reportlab.lib import colors
+                  from reportlab.lib.units import inch
+                  import io
+                  import re
+                  
+                  # Create PDF buffer
+                  buffer = io.BytesIO()
+                  doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=72, leftMargin=72, topMargin=72, bottomMargin=18)
+                  
+                  # Get styles
+                  styles = getSampleStyleSheet()
+                  
+                  # Custom styles
+                  title_style = ParagraphStyle('CustomTitle', parent=styles['Heading1'], fontSize=24, textColor=colors.HexColor('#2a5298'), alignment=1, spaceAfter=30)
+                  subtitle_style = ParagraphStyle('CustomSubtitle', parent=styles['Normal'], fontSize=14, textColor=colors.grey, alignment=1, spaceAfter=20)
+                  heading_style = ParagraphStyle('CustomHeading', parent=styles['Heading2'], fontSize=16, textColor=colors.HexColor('#495057'), spaceAfter=12)
+                  
+                  # Build story
+                  story = []
+                  
+                  # Title
+                  story.append(Paragraph("Security Assessment Report", title_style))
+                  story.append(Paragraph(f"AWS Inspector Analysis - {datetime.now(timezone.utc).strftime('%B %d, %Y')}", subtitle_style))
+                  story.append(Spacer(1, 20))
+                  
+                  # Parse HTML content to extract key information
+                  # Extract scan details using regex
+                  scan_id_match = re.search(r'<td[^>]*>([^<]*inspector-v2-[^<]*)</td>', html_content)
+                  scan_id = scan_id_match.group(1) if scan_id_match else "N/A"
+                  
+                  date_match = re.search(r'<td[^>]*>([^<]*UTC[^<]*)</td>', html_content)
+                  scan_date = date_match.group(1) if date_match else datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+                  
+                  instance_match = re.search(r'<td[^>]*>(\d+[^<]*instances[^<]*)</td>', html_content)
+                  instances = instance_match.group(1) if instance_match else "N/A"
+                  
+                  # Extract risk level
+                  risk_match = re.search(r'<div class="risk-level">([^<]*)</div>', html_content)
+                  risk_level = risk_match.group(1).strip() if risk_match else "Low Risk"
+                  
+                  # Extract metrics
+                  critical_match = re.search(r'<div class="metric critical">.*?<div class="metric-value">(\d+)</div>', html_content, re.DOTALL)
+                  high_match = re.search(r'<div class="metric high">.*?<div class="metric-value">(\d+)</div>', html_content, re.DOTALL)
+                  medium_match = re.search(r'<div class="metric medium">.*?<div class="metric-value">(\d+)</div>', html_content, re.DOTALL)
+                  low_match = re.search(r'<div class="metric low">.*?<div class="metric-value">(\d+)</div>', html_content, re.DOTALL)
+                  
+                  critical_count = critical_match.group(1) if critical_match else "0"
+                  high_count = high_match.group(1) if high_match else "0"
+                  medium_count = medium_match.group(1) if medium_match else "0"
+                  low_count = low_match.group(1) if low_match else "0"
+                  
+                  # Executive Summary
+                  story.append(Paragraph("Executive Summary", heading_style))
+                  
+                  # Summary table
+                  summary_data = [
+                      ['Scan Reference', scan_id],
+                      ['Infrastructure Scanned', instances],
+                      ['Assessment Date', scan_date],
+                      ['Risk Level', risk_level]
+                  ]
+                  
+                  summary_table = Table(summary_data, colWidths=[2*inch, 4*inch])
+                  summary_table.setStyle(TableStyle([
+                      ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f8f9fa')),
+                      ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+                      ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                      ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+                      ('FONTSIZE', (0, 0), (-1, -1), 10),
+                      ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#ddd')),
+                      ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                      ('LEFTPADDING', (0, 0), (-1, -1), 12),
+                      ('RIGHTPADDING', (0, 0), (-1, -1), 12),
+                      ('TOPPADDING', (0, 0), (-1, -1), 8),
+                      ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+                  ]))
+                  
+                  story.append(summary_table)
+                  story.append(Spacer(1, 20))
+                  
+                  # Security Metrics
+                  story.append(Paragraph("Security Findings Summary", heading_style))
+                  
+                  metrics_data = [
+                      ['Severity Level', 'Count', 'Status'],
+                      ['Critical', critical_count, 'Immediate attention required' if int(critical_count) > 0 else 'None found'],
+                      ['High Priority', high_count, 'Plan remediation within 30 days' if int(high_count) > 0 else 'None found'],
+                      ['Medium Priority', medium_count, 'Review and address when convenient' if int(medium_count) > 0 else 'None found'],
+                      ['Low Priority', low_count, 'Continue monitoring' if int(low_count) > 0 else 'None found']
+                  ]
+                  
+                  metrics_table = Table(metrics_data, colWidths=[1.5*inch, 1*inch, 3.5*inch])
+                  metrics_table.setStyle(TableStyle([
+                      ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#343a40')),
+                      ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                      ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                      ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                      ('FONTNAME', (0, 1), (0, -1), 'Helvetica-Bold'),
+                      ('FONTSIZE', (0, 0), (-1, -1), 10),
+                      ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#ddd')),
+                      ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                      ('LEFTPADDING', (0, 0), (-1, -1), 12),
+                      ('RIGHTPADDING', (0, 0), (-1, -1), 12),
+                      ('TOPPADDING', (0, 0), (-1, -1), 8),
+                      ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+                  ]))
+                  
+                  # Color code the severity rows
+                  if int(critical_count) > 0:
+                      metrics_table.setStyle(TableStyle([('BACKGROUND', (0, 1), (-1, 1), colors.HexColor('#ffe6e6'))]))
+                  if int(high_count) > 0:
+                      metrics_table.setStyle(TableStyle([('BACKGROUND', (0, 2), (-1, 2), colors.HexColor('#fff3e0'))]))
+                  if int(medium_count) > 0:
+                      metrics_table.setStyle(TableStyle([('BACKGROUND', (0, 3), (-1, 3), colors.HexColor('#fffbf0'))]))
+                  
+                  story.append(metrics_table)
+                  story.append(Spacer(1, 20))
+                  
+                  # Next Steps
+                  story.append(Paragraph("Next Steps", heading_style))
+                  
+                  total_issues = int(critical_count) + int(high_count) + int(medium_count)
+                  if total_issues > 0:
+                      if int(critical_count) > 0:
+                          next_steps = "Immediate attention required for critical security issues"
+                      elif int(high_count) > 0:
+                          next_steps = "Plan remediation within 30 days for high-priority items"
+                      else:
+                          next_steps = "Review and address medium-priority items when convenient"
+                  else:
+                      next_steps = "Continue monitoring. No urgent action required."
+                  
+                  story.append(Paragraph(next_steps, styles['Normal']))
+                  story.append(Spacer(1, 30))
+                  
+                  # Footer
+                  footer_text = f"Report generated by AWS Inspector V2 | For technical details, contact your IT security team | Scan ID: {scan_id}"
+                  footer_style = ParagraphStyle('Footer', parent=styles['Normal'], fontSize=8, textColor=colors.grey, alignment=1)
+                  story.append(Paragraph(footer_text, footer_style))
+                  
+                  # Build PDF
+                  doc.build(story)
+                  pdf_data = buffer.getvalue()
+                  buffer.close()
+                  
                   print(f"Generated PDF report: {len(pdf_data)} bytes")
                   return pdf_data
+                  
               except Exception as e:
                   print(f"PDF generation failed: {str(e)}")
-                  raise e  # Fail hard, no fallback (as requested)
+                  raise e  # Fail hard, no fallback
 
           def _upload_and_notify(pdf_data, scan_name, scan_id, instance_ids, name_map):
               """Upload PDF report and send comprehensive notification."""
