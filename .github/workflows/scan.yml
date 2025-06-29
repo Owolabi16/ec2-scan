@@ -44,10 +44,27 @@ jobs:
           # Create deployment directory
           mkdir -p lambda-package
           
+          # Create requirements.txt for wkhtmltopdf
+          cat > requirements.txt << 'DEPS'
+          pdfkit==1.0.0
+          DEPS
+          
+          # Install dependencies
+          pip install -r requirements.txt -t lambda-package/
+          
+          # Download wkhtmltopdf binary for Lambda
+          cd lambda-package
+          curl -L https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6-1/wkhtmltox_0.12.6-1.centos7.x86_64.rpm -o wkhtmltopdf.rpm
+          rpm2cpio wkhtmltopdf.rpm | cpio -idmv
+          mv usr/local/bin/wkhtmltopdf ./
+          rm -rf usr wkhtmltopdf.rpm
+          cd ..
+          
           # Create the Python script inline
           cat > lambda-package/lambda_function.py << 'EOF'
-          import json, boto3, os, base64
+          import json, boto3, os, tempfile
           from datetime import datetime, timezone
+          import subprocess
 
           SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
           SCAN_TYPE = os.environ.get("SCAN_TYPE", "PACKAGE_VULNERABILITY")
@@ -112,123 +129,190 @@ jobs:
                   'instance_count': len(instance_ids)
               }
 
-          def _generate_professional_report(scan_id, scan_name, instance_ids, name_map, filtered_data):
-              """Generate comprehensive HTML report with executive styling."""
-              # Get instance names for summary
-              instance_names = [name_map.get(iid, 'Unnamed') for iid in instance_ids[:3]]
-              if len(instance_ids) > 3:
-                  instance_names.append(f"... and {len(instance_ids)-3} more")
+          def _generate_readable_html_report(scan_id, scan_name, instance_ids, name_map, filtered_data):
+              """Generate clean, business-friendly HTML report."""
+              # Get instance summary
+              instance_summary = f"{len(instance_ids)} EC2 instances"
+              if len(instance_ids) <= 3:
+                  instance_names = [name_map.get(iid, 'Unnamed') for iid in instance_ids]
+                  instance_summary += f" ({', '.join(instance_names)})"
               
-              # Risk assessment
-              risk_level = "HIGH RISK" if filtered_data['total_critical'] > 0 else \
-                          "MEDIUM RISK" if filtered_data['total_high'] > 0 else \
-                          "LOW RISK" if filtered_data['total_medium'] > 0 else \
-                          "MINIMAL RISK"
+              # Business-friendly risk assessment
+              if filtered_data['total_critical'] > 0:
+                  risk_level, risk_color, risk_action = "Critical Risk", "#dc3545", "Immediate attention required"
+              elif filtered_data['total_high'] > 0:
+                  risk_level, risk_color, risk_action = "High Risk", "#fd7e14", "Plan remediation within 30 days"
+              elif filtered_data['total_medium'] > 0:
+                  risk_level, risk_color, risk_action = "Medium Risk", "#ffc107", "Review and address when convenient"
+              else:
+                  risk_level, risk_color, risk_action = "Low Risk", "#28a745", "Continue monitoring"
               
-              # Generate findings HTML
+              # Generate readable findings
               findings_html = ""
-              for i, finding in enumerate(filtered_data['priority_findings'], 1):
-                  severity = finding.get('severity', 'UNKNOWN')
-                  color = {'CRITICAL': '#dc3545', 'HIGH': '#fd7e14', 'MEDIUM': '#ffc107', 'LOW': '#28a745'}.get(severity, '#6c757d')
-                  title = finding.get('title', 'Security Issue')[:50]
-                  vuln_id = finding.get('packageVulnerabilityDetails', {}).get('vulnerabilityId', '')
-                  resource = finding.get('resources', [{}])[0].get('id', 'Unknown')
-                  description = finding.get("description", "No description available")[:120]
+              if filtered_data['priority_findings']:
+                  for i, finding in enumerate(filtered_data['priority_findings'], 1):
+                      title = finding.get('title', 'Security Issue')
+                      severity = finding.get('severity', 'UNKNOWN')
+                      description = finding.get('description', 'No description available')
+                      
+                      # Simplify technical jargon
+                      if len(description) > 150:
+                          description = description[:147] + "..."
+                      
+                      # Extract CVE if available
+                      cve = finding.get('packageVulnerabilityDetails', {}).get('vulnerabilityId', '')
+                      resource = finding.get('resources', [{}])[0].get('id', 'Unknown Resource')
+                      
+                      # Severity colors
+                      sev_color = {'CRITICAL': '#dc3545', 'HIGH': '#fd7e14', 'MEDIUM': '#ffc107'}.get(severity, '#6c757d')
+                      
+                      findings_html += f"""
+                      <div style="margin: 15px 0; padding: 20px; border-left: 5px solid {sev_color}; background: #f8f9fa; border-radius: 5px;">
+                          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                              <h4 style="margin: 0; color: #333; font-size: 16px;">{i}. {title}</h4>
+                              <span style="background: {sev_color}; color: white; padding: 5px 10px; border-radius: 4px; font-size: 12px; font-weight: bold;">{severity}</span>
+                          </div>
+                          <p style="margin: 5px 0; color: #666; font-size: 14px;"><strong>Affected System:</strong> {resource}</p>
+                          {f'<p style="margin: 5px 0; color: #666; font-size: 14px;"><strong>Reference:</strong> {cve}</p>' if cve else ''}
+                          <p style="margin: 10px 0 0 0; color: #555; font-size: 14px; line-height: 1.4;">{description}</p>
+                      </div>"""
+              else:
+                  findings_html = '<div style="text-align: center; padding: 40px; color: #28a745; font-size: 18px;">✓ No critical security issues detected</div>'
+              
+              # Executive summary
+              total_issues = filtered_data['total_critical'] + filtered_data['total_high'] + filtered_data['total_medium']
+              if total_issues > 0:
+                  summary = f"Found {total_issues} security issues requiring attention"
+              else:
+                  summary = "Security scan completed successfully with no critical issues"
+              
+              # Generate clean HTML
+              html_content = f"""<!DOCTYPE html>
+              <html><head>
+              <meta charset="UTF-8">
+              <title>Security Assessment Report</title>
+              <style>
+                  body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 20px; line-height: 1.6; color: #333; background: #fff; }}
+                  .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; text-align: center; margin-bottom: 30px; border-radius: 8px; }}
+                  .header h1 {{ margin: 0; font-size: 28px; font-weight: 300; }}
+                  .header p {{ margin: 10px 0 0 0; opacity: 0.9; font-size: 16px; }}
+                  .summary {{ background: #f8f9fa; padding: 25px; border-radius: 8px; margin-bottom: 25px; border-left: 5px solid #007bff; }}
+                  .risk-box {{ text-align: center; margin: 20px 0; }}
+                  .risk-level {{ font-size: 24px; font-weight: bold; color: {risk_color}; margin-bottom: 10px; }}
+                  .risk-action {{ font-size: 16px; color: #666; }}
+                  .metrics {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin: 25px 0; }}
+                  .metric {{ background: white; padding: 20px; text-align: center; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+                  .metric-value {{ font-size: 32px; font-weight: bold; margin: 0; }}
+                  .metric-label {{ font-size: 14px; color: #666; margin: 5px 0 0 0; text-transform: uppercase; letter-spacing: 1px; }}
+                  .critical .metric-value {{ color: #dc3545; }}
+                  .high .metric-value {{ color: #fd7e14; }}
+                  .medium .metric-value {{ color: #ffc107; }}
+                  .low .metric-value {{ color: #28a745; }}
+                  .details {{ background: white; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+                  .details-header {{ background: #343a40; color: white; padding: 20px; font-size: 20px; font-weight: 500; border-radius: 8px 8px 0 0; margin: 0; }}
+                  .details-content {{ padding: 25px; }}
+                  .footer {{ margin-top: 30px; padding: 20px; background: #f8f9fa; border-radius: 8px; text-align: center; font-size: 14px; color: #666; }}
+                  table {{ width: 100%; border-collapse: collapse; margin: 15px 0; }}
+                  th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }}
+                  th {{ background-color: #f8f9fa; font-weight: 600; }}
+              </style>
+              </head>
+              <body>
+              
+              <div class="header">
+                  <h1>Security Assessment Report</h1>
+                  <p>AWS Inspector Analysis - {datetime.now(timezone.utc).strftime('%B %d, %Y')}</p>
+              </div>
+              
+              <div class="summary">
+                  <h2 style="margin: 0 0 15px 0; color: #495057;">Executive Summary</h2>
+                  <p style="font-size: 16px; margin: 0 0 15px 0;">{summary}</p>
                   
-                  findings_html += f'''
-                  <div style="margin: 10px 0; padding: 15px; border-left: 5px solid {color}; background: #f8f9fa; border-radius: 5px;">
-                      <div style="display: flex; justify-content: space-between; align-items: center;">
-                          <h4 style="margin: 0; color: #333;">{i}. {title}</h4>
-                          <span style="background: {color}; color: white; padding: 4px 8px; border-radius: 3px; font-size: 12px; font-weight: bold;">{severity}</span>
-                      </div>
-                      <p style="margin: 8px 0 4px 0; color: #666;"><strong>Affected:</strong> {resource}</p>
-                      {f'<p style="margin: 4px 0; color: #666;"><strong>CVE:</strong> {vuln_id}</p>' if vuln_id else ''}
-                      <p style="margin: 4px 0; color: #555; font-size: 14px;">{description}...</p>
-                  </div>'''
-              
-              # Action recommendation
-              action_needed = "Immediate action required" if filtered_data['total_critical'] > 0 else \
-                            "Review and plan remediation" if filtered_data['total_high'] > 0 else \
-                            "Monitor and address when convenient" if filtered_data['total_medium'] > 0 else \
-                            "No immediate action needed"
-              
-              next_steps = "1. Address critical issues immediately 2. Review high-priority items 3. Schedule medium-priority fixes" if \
-                          filtered_data['total_critical'] + filtered_data['total_high'] > 0 else "Continue monitoring. No urgent action required."
-              
-              # Complete HTML report
-              html_content = f'''<!DOCTYPE html>
-          <html><head><meta charset="UTF-8"><title>AWS Inspector Report</title>
-          <style>
-          body {{ font-family: Arial, sans-serif; margin: 20px; line-height: 1.6; color: #333; }}
-          .header {{ background: #2a5298; color: white; padding: 20px; border-radius: 8px; text-align: center; margin-bottom: 20px; }}
-          .summary-box {{ background: #f8f9fa; padding: 15px; border-radius: 5px; margin: 10px 0; }}
-          .metrics {{ display: flex; gap: 10px; margin: 15px 0; }}
-          .metric {{ text-align: center; padding: 10px; background: white; border: 2px solid #ddd; border-radius: 5px; flex: 1; }}
-          .critical {{ border-color: #dc3545; }} .high {{ border-color: #fd7e14; }} .medium {{ border-color: #ffc107; }}
-          </style></head>
-          <body>
-          <div class="header">
-              <h1>AWS Inspector Security Report</h1>
-              <p>Executive Summary - Priority Issues Only</p>
-          </div>
-
-          <div class="summary-grid">
-              <div class="summary-box">
-                  <h3 style="margin: 0 0 15px 0; color: #495057;">Scan Details</h3>
                   <table>
-                      <tr><td style="background: #f8f9fa; font-weight: 600; width: 140px; padding: 8px 12px; border-bottom: 1px solid #e9ecef;">Scan ID:</td><td style="padding: 8px 12px; border-bottom: 1px solid #e9ecef;">{scan_id}</td></tr>
-                      <tr><td style="background: #f8f9fa; font-weight: 600; width: 140px; padding: 8px 12px; border-bottom: 1px solid #e9ecef;">Date:</td><td style="padding: 8px 12px; border-bottom: 1px solid #e9ecef;">{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</td></tr>
-                      <tr><td style="background: #f8f9fa; font-weight: 600; width: 140px; padding: 8px 12px; border-bottom: 1px solid #e9ecef;">Instances:</td><td style="padding: 8px 12px; border-bottom: 1px solid #e9ecef;">{len(instance_ids)} ({', '.join(instance_names)})</td></tr>
-                      <tr><td style="background: #f8f9fa; font-weight: 600; width: 140px; padding: 8px 12px; border-bottom: 1px solid #e9ecef;">Total Issues:</td><td style="padding: 8px 12px; border-bottom: 1px solid #e9ecef;">{filtered_data['total_findings']}</td></tr>
+                      <tr><th>Scan Reference</th><td>{scan_id}</td></tr>
+                      <tr><th>Infrastructure Scanned</th><td>{instance_summary}</td></tr>
+                      <tr><th>Assessment Date</th><td>{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</td></tr>
+                      <tr><th>Total Findings</th><td>{filtered_data['total_findings']} security items reviewed</td></tr>
                   </table>
+                  
+                  <div class="risk-box">
+                      <div class="risk-level">{risk_level}</div>
+                      <div class="risk-action">{risk_action}</div>
+                  </div>
               </div>
               
-              <div class="summary-box">
-                  <h3 style="margin: 0 0 15px 0; color: #495057;">Risk Assessment</h3>
-                  <div style="text-align: center; font-size: 18px; font-weight: bold; margin: 15px 0; padding: 15px; border-radius: 8px; background: #f8f9fa;">{risk_level}</div>
-                  <p style="font-size: 14px; text-align: center; margin: 10px 0 0 0; color: #666;">{action_needed}</p>
+              <div class="metrics">
+                  <div class="metric critical">
+                      <div class="metric-value">{filtered_data['total_critical']}</div>
+                      <div class="metric-label">Critical</div>
+                  </div>
+                  <div class="metric high">
+                      <div class="metric-value">{filtered_data['total_high']}</div>
+                      <div class="metric-label">High Priority</div>
+                  </div>
+                  <div class="metric medium">
+                      <div class="metric-value">{filtered_data['total_medium']}</div>
+                      <div class="metric-label">Medium Priority</div>
+                  </div>
+                  <div class="metric low">
+                      <div class="metric-value">{filtered_data['total_low']}</div>
+                      <div class="metric-label">Low Priority</div>
+                  </div>
               </div>
-          </div>
-
-          <div class="metrics">
-              <div class="metric critical">
-                  <h3 style="font-size: 24px; font-weight: bold; margin: 0; color: #dc3545;">{filtered_data['total_critical']}</h3>
-                  <p style="font-size: 12px; color: #666; margin: 5px 0 0 0;">Critical</p>
-              </div>
-              <div class="metric high">
-                  <h3 style="font-size: 24px; font-weight: bold; margin: 0; color: #fd7e14;">{filtered_data['total_high']}</h3>
-                  <p style="font-size: 12px; color: #666; margin: 5px 0 0 0;">High</p>
-              </div>
-              <div class="metric medium">
-                  <h3 style="font-size: 24px; font-weight: bold; margin: 0; color: #ffc107;">{filtered_data['total_medium']}</h3>
-                  <p style="font-size: 12px; color: #666; margin: 5px 0 0 0;">Medium</p>
-              </div>
-              <div class="metric">
-                  <h3 style="font-size: 24px; font-weight: bold; margin: 0; color: #28a745;">{filtered_data['total_low']}</h3>
-                  <p style="font-size: 12px; color: #666; margin: 5px 0 0 0;">Low</p>
-              </div>
-          </div>
-
-          <div style="margin-top: 25px;">
-              <h2 style="background: #343a40; color: white; padding: 15px; border-radius: 8px 8px 0 0; margin: 0;">Priority Security Issues (Top {len(filtered_data['priority_findings'])})</h2>
-              <div style="border: 1px solid #343a40; border-top: none; border-radius: 0 0 8px 8px; padding: 20px;">
-                  {findings_html if findings_html else '<p style="text-align: center; color: #28a745; font-size: 16px;">No critical security issues detected!</p>'}
-              </div>
-          </div>
-
-          <div style="margin-top: 30px; padding: 20px; background: #f8f9fa; border-radius: 8px; text-align: center; border: 1px solid #e9ecef;">
-              <p><strong>Next Steps:</strong> {next_steps}</p>
-              <p style="font-size: 12px; color: #666; margin-top: 10px;">
-                  Report generated by AWS Inspector V2 | Scan ID: {scan_id} | This report shows only the most critical findings for executive review.
-              </p>
-          </div>
-          </body></html>'''
               
-              print(f"Generated HTML report: {len(html_content)} characters")
-              return base64.b64encode(html_content.encode('utf-8')).decode('utf-8')
+              <div class="details">
+                  <h2 class="details-header">Priority Security Findings</h2>
+                  <div class="details-content">
+                      {findings_html}
+                  </div>
+              </div>
+              
+              <div class="footer">
+                  <p><strong>Next Steps:</strong> {risk_action.lower()}</p>
+                  <p>Report generated by AWS Inspector V2 | For technical details, contact your IT security team</p>
+              </div>
+              
+              </body></html>"""
+              
+              return html_content
+
+          def _convert_html_to_pdf(html_content, scan_name):
+              """Convert HTML to PDF using wkhtmltopdf (exact same logic as example)."""
+              # Create temporary files
+              with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False) as html_file:
+                  html_file.write(html_content)
+                  html_path = html_file.name
+              
+              pdf_path = f"/tmp/{scan_name}.pdf"
+              
+              try:
+                  # Use wkhtmltopdf binary (same as example workflow)
+                  wkhtmltopdf_path = os.path.join(os.path.dirname(__file__), 'wkhtmltopdf')
+                  cmd = [wkhtmltopdf_path, '--page-size', 'A4', '--margin-top', '0.75in', '--margin-bottom', '0.75in', 
+                         '--margin-left', '0.75in', '--margin-right', '0.75in', html_path, pdf_path]
+                  
+                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                  
+                  if result.returncode != 0:
+                      raise Exception(f"wkhtmltopdf failed: {result.stderr}")
+                  
+                  # Read PDF data
+                  with open(pdf_path, 'rb') as pdf_file:
+                      pdf_data = pdf_file.read()
+                  
+                  print(f"Generated PDF report: {len(pdf_data)} bytes")
+                  return pdf_data
+                  
+              finally:
+                  # Cleanup
+                  try:
+                      os.unlink(html_path)
+                      os.unlink(pdf_path)
+                  except:
+                      pass
 
           def _upload_and_notify(pdf_data, scan_name, scan_id, instance_ids, name_map):
-              """Upload report and send comprehensive notification."""
+              """Upload PDF report and send comprehensive notification."""
               # Upload to S3
               try:
                   s3_client = boto3.client('s3')
@@ -249,28 +333,28 @@ jobs:
               
               # Send notification
               instance_list = [f"{name_map[iid]}: {iid}" for iid in instance_ids]
-              pdf_section = f"\n\nSBOM PDF Report: {pdf_url}" if pdf_url else "\n\nPDF report generation in progress..."
               
-              message = f"""AWS Inspector V2 scan completed with SBOM analysis.
+              message = f"""AWS Inspector V2 security assessment completed.
 
           Scan: {scan_name}
           ID: {scan_id}
           Type: {SCAN_TYPE}
-          Instances: {len(instance_ids)}
+          Infrastructure: {len(instance_ids)} instances
 
-          Scanned Instances:
+          Scanned Systems:
           {chr(10).join(instance_list)}
-          {pdf_section}
 
-          Status available in AWS Console."""
+          Security Report: {pdf_url if pdf_url else 'Upload in progress...'}
+
+          For questions, contact your IT security team."""
               
-              sns.publish(TopicArn=SNS_TOPIC_ARN, Subject=f"Inspector SBOM Report - {scan_name}", Message=message)
-              print("Enhanced notification sent with PDF link")
+              sns.publish(TopicArn=SNS_TOPIC_ARN, Subject=f"Security Assessment Report - {scan_name}", Message=message)
+              print("Security assessment notification sent")
               return pdf_url
 
           def lambda_handler(event, context):
               """Main Lambda handler with complete SBOM processing."""
-              print("▶︎ Received event:", json.dumps(event))
+              print("Starting AWS Inspector security assessment...")
               
               try:
                   # Get instances and names
@@ -298,22 +382,26 @@ jobs:
                   print("Retrieving SBOM and findings data...")
                   filtered_data = _get_filtered_findings(instance_ids)
                   
-                  print("Generating clean, filtered PDF report...")
+                  print("Generating business-friendly security report...")
                   scan_id = f"inspector-v2-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
-                  scan_name = f"ec2-scan-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M')}"
-                  pdf_data = _generate_professional_report(scan_id, scan_name, instance_ids, name_map, filtered_data)
+                  scan_name = f"security-assessment-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M')}"
+                  
+                  # Generate HTML report
+                  html_content = _generate_readable_html_report(scan_id, scan_name, instance_ids, name_map, filtered_data)
+                  
+                  # Convert to PDF using wkhtmltopdf
+                  pdf_data = _convert_html_to_pdf(html_content, scan_name)
                   
                   # Upload and notify
                   pdf_url = _upload_and_notify(pdf_data, scan_name, scan_id, instance_ids, name_map)
                   
-                  print("Inspector V2 scanning completed with PDF report")
+                  print("Security assessment completed successfully")
                   print(f"PDF report generated: {len(pdf_data)} bytes")
-                  print("Scan initiated successfully")
-                  return {"statusCode": 200, "body": f"Scan started: {scan_id}"}
+                  return {"statusCode": 200, "body": f"Assessment completed: {scan_id}"}
                   
               except Exception as e:
-                  print(f"Error: {str(e)}")
-                  return {"statusCode": 500, "body": f"Failed: {str(e)}"}
+                  print(f"Security assessment failed: {str(e)}")
+                  return {"statusCode": 500, "body": f"Assessment failed: {str(e)}"}
           EOF
 
           # Create ZIP package
