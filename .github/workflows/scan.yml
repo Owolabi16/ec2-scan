@@ -1,4 +1,4 @@
-name: Deploy AWS Inspector Lambda Function.
+name: Deploy AWS Inspector Lambda Function
 
 on:
   push:
@@ -429,7 +429,7 @@ jobs:
               """Upload PDF report and send comprehensive notification."""
               # Upload to S3
               try:
-              
+
                   year_month = datetime.now(timezone.utc).strftime('%Y-%m')
                   s3_key = f"security-reports/{ENVIRONMENT_FILTER}/{year_month}/inspector-assessment.pdf"
                   
