@@ -285,7 +285,7 @@ jobs:
                   
                   # Convert HTML to simple text (basic approach)
                   text_content = re.sub('<[^<]+?>', ' ', html_content)
-                  text_content = re.sub('\s+', ' ', text_content).strip()
+                  text_content = re.sub(r'\s+', ' ', text_content).strip()
                   
                   # Split into paragraphs
                   paragraphs = text_content.split('\n')
