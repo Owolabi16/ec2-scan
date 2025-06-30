@@ -56,816 +56,349 @@ jobs:
           cat > network-scanner-package/lambda_function.py << 'EOF'
           import json, boto3, os
           from datetime import datetime, timezone
-          from concurrent.futures import ThreadPoolExecutor, as_completed
-          import threading
+          import re
 
           # Environment variables
           SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
-          SCAN_TYPE = os.environ.get("SCAN_TYPE", "NETWORK_SECURITY_GROUPS")
-          ENVIRONMENT_FILTER = os.environ.get("ENVIRONMENT_FILTER", "")
           REPORTS_BUCKET = os.environ.get("REPORTS_BUCKET", "network-security-reports")
+          ENVIRONMENT_FILTER = os.environ.get("ENVIRONMENT_FILTER", "")
 
           # AWS clients
           sns = boto3.client("sns")
-          
-          # Thread-safe storage for results
-          scan_results = {}
-          scan_lock = threading.Lock()
 
-          # Port risk and service mapping
-          PORT_RISK_MAP = {
-              # Critical Risk Ports (should never be open to 0.0.0.0/0)
-              22: {"service": "SSH", "risk": "CRITICAL", "description": "Secure Shell remote access"},
-              3389: {"service": "RDP", "risk": "CRITICAL", "description": "Remote Desktop Protocol"},
-              1433: {"service": "SQL Server", "risk": "CRITICAL", "description": "Microsoft SQL Server database"},
-              3306: {"service": "MySQL", "risk": "CRITICAL", "description": "MySQL database server"},
-              5432: {"service": "PostgreSQL", "risk": "CRITICAL", "description": "PostgreSQL database server"},
-              6379: {"service": "Redis", "risk": "CRITICAL", "description": "Redis in-memory database"},
-              27017: {"service": "MongoDB", "risk": "CRITICAL", "description": "MongoDB database server"},
-              5984: {"service": "CouchDB", "risk": "CRITICAL", "description": "CouchDB database server"},
-              9200: {"service": "Elasticsearch", "risk": "CRITICAL", "description": "Elasticsearch search engine"},
+          def get_port_risk(port):
+              """Simplified port risk assessment."""
+              critical_ports = {22, 3389, 1433, 3306, 5432, 6379, 27017}  # SSH, RDP, Databases
+              high_risk_ports = {21, 23, 25, 53, 135, 139, 445, 8080, 8443}  # Legacy/Admin services
               
-              # High Risk Ports (restricted access recommended)
-              21: {"service": "FTP", "risk": "HIGH", "description": "File Transfer Protocol"},
-              23: {"service": "Telnet", "risk": "HIGH", "description": "Unencrypted remote access"},
-              25: {"service": "SMTP", "risk": "HIGH", "description": "Simple Mail Transfer Protocol"},
-              53: {"service": "DNS", "risk": "HIGH", "description": "Domain Name System"},
-              135: {"service": "RPC", "risk": "HIGH", "description": "Windows RPC Endpoint Mapper"},
-              139: {"service": "NetBIOS", "risk": "HIGH", "description": "NetBIOS Session Service"},
-              445: {"service": "SMB", "risk": "HIGH", "description": "Server Message Block"},
-              993: {"service": "IMAPS", "risk": "HIGH", "description": "Secure IMAP email"},
-              995: {"service": "POP3S", "risk": "HIGH", "description": "Secure POP3 email"},
-              8080: {"service": "HTTP Alt", "risk": "HIGH", "description": "Alternative HTTP port"},
-              8443: {"service": "HTTPS Alt", "risk": "HIGH", "description": "Alternative HTTPS port"},
-              
-              # Medium Risk Ports (common services, consider restrictions)
-              80: {"service": "HTTP", "risk": "MEDIUM", "description": "Hypertext Transfer Protocol"},
-              443: {"service": "HTTPS", "risk": "MEDIUM", "description": "Secure HTTP"},
-              110: {"service": "POP3", "risk": "MEDIUM", "description": "Post Office Protocol v3"},
-              143: {"service": "IMAP", "risk": "MEDIUM", "description": "Internet Message Access Protocol"},
-              993: {"service": "IMAPS", "risk": "MEDIUM", "description": "Secure IMAP"},
-              465: {"service": "SMTPS", "risk": "MEDIUM", "description": "Secure SMTP"},
-              587: {"service": "SMTP Sub", "risk": "MEDIUM", "description": "SMTP Submission"},
-              
-              # Low Risk Ports (standard services)
-              53: {"service": "DNS", "risk": "LOW", "description": "Domain Name System (outbound)"},
-              123: {"service": "NTP", "risk": "LOW", "description": "Network Time Protocol"},
-          }
-
-          def get_port_info(port):
-              """Get service information and risk level for a port."""
-              if port in PORT_RISK_MAP:
-                  return PORT_RISK_MAP[port]
-              
-              # Handle port ranges and unknown ports
-              if port < 1024:
-                  return {"service": f"System Port {port}", "risk": "HIGH", "description": f"Reserved system port {port}"}
-              elif port < 49152:
-                  return {"service": f"Registered Port {port}", "risk": "MEDIUM", "description": f"Registered service port {port}"}
+              if port in critical_ports:
+                  return "CRITICAL"
+              elif port in high_risk_ports or port < 1024:
+                  return "HIGH"
+              elif port in {80, 443}:
+                  return "MEDIUM"
               else:
-                  return {"service": f"Dynamic Port {port}", "risk": "LOW", "description": f"Dynamic/private port {port}"}
+                  return "LOW"
 
-          def is_internet_accessible(ip_range):
-              """Check if an IP range allows internet access."""
-              internet_ranges = ['0.0.0.0/0', '::/0']
-              return ip_range in internet_ranges
+          def has_internet_exposure(security_group):
+              """Check if security group has internet exposure."""
+              for rule in security_group.get('IpPermissions', []):
+                  for ip_range in rule.get('IpRanges', []):
+                      if ip_range.get('CidrIp') == '0.0.0.0/0':
+                          return True
+              return False
 
-          def analyze_security_group_rules(sg, region):
-              """Analyze security group rules for risks."""
-              analysis = {
-                  'group_id': sg['GroupId'],
-                  'group_name': sg.get('GroupName', 'N/A'),
-                  'description': sg.get('Description', 'N/A'),
-                  'vpc_id': sg.get('VpcId', 'EC2-Classic'),
-                  'region': region,
-                  'inbound_rules': [],
-                  'outbound_rules': [],
-                  'internet_exposed': False,
-                  'critical_exposures': [],
-                  'high_risk_exposures': [],
-                  'total_rules': 0,
-                  'risk_score': 0
-              }
+          def get_critical_exposures(security_group):
+              """Find critical port exposures to internet."""
+              critical_exposures = []
               
-              # Analyze inbound rules
-              for rule in sg.get('IpPermissions', []):
+              for rule in security_group.get('IpPermissions', []):
                   from_port = rule.get('FromPort')
                   to_port = rule.get('ToPort')
-                  protocol = rule.get('IpProtocol', 'Unknown')
                   
-                  # Handle port ranges
-                  if from_port == to_port:
-                      ports = [from_port] if from_port else ['All']
-                  elif from_port and to_port:
-                      ports = list(range(from_port, to_port + 1))
+                  if from_port and to_port:
+                      ports = [from_port] if from_port == to_port else list(range(from_port, to_port + 1))
                   else:
                       ports = ['All']
                   
-                  # Check each IP range
                   for ip_range in rule.get('IpRanges', []):
-                      cidr = ip_range.get('CidrIp', 'Unknown')
-                      internet_exposed = is_internet_accessible(cidr)
-                      
-                      if internet_exposed:
-                          analysis['internet_exposed'] = True
-                      
-                      rule_analysis = {
-                          'direction': 'inbound',
-                          'protocol': protocol,
-                          'ports': ports,
-                          'source': cidr,
-                          'internet_exposed': internet_exposed,
-                          'description': ip_range.get('Description', ''),
-                          'port_details': []
-                      }
-                      
-                      # Analyze each port
-                      for port in ports:
-                          if port != 'All':
-                              port_info = get_port_info(port)
-                              rule_analysis['port_details'].append({
-                                  'port': port,
-                                  'service': port_info['service'],
-                                  'risk': port_info['risk'],
-                                  'description': port_info['description']
-                              })
-                              
-                              # Track critical exposures
-                              if internet_exposed and port_info['risk'] == 'CRITICAL':
-                                  analysis['critical_exposures'].append({
+                      if ip_range.get('CidrIp') == '0.0.0.0/0':
+                          for port in ports:
+                              if port != 'All' and get_port_risk(port) == 'CRITICAL':
+                                  critical_exposures.append({
                                       'port': port,
-                                      'service': port_info['service'],
-                                      'source': cidr
+                                      'sg_id': security_group['GroupId'],
+                                      'sg_name': security_group.get('GroupName', 'N/A')
                                   })
-                                  analysis['risk_score'] += 10
-                              elif internet_exposed and port_info['risk'] == 'HIGH':
-                                  analysis['high_risk_exposures'].append({
-                                      'port': port,
-                                      'service': port_info['service'],
-                                      'source': cidr
-                                  })
-                                  analysis['risk_score'] += 5
-                      
-                      analysis['inbound_rules'].append(rule_analysis)
-                      analysis['total_rules'] += 1
-                  
-                  # Check security group references
-                  for sg_ref in rule.get('UserIdGroupPairs', []):
-                      rule_analysis = {
-                          'direction': 'inbound',
-                          'protocol': protocol,
-                          'ports': ports,
-                          'source': f"SG: {sg_ref.get('GroupId', 'Unknown')}",
-                          'internet_exposed': False,
-                          'description': sg_ref.get('Description', ''),
-                          'port_details': []
-                      }
-                      analysis['inbound_rules'].append(rule_analysis)
-                      analysis['total_rules'] += 1
               
-              # Analyze outbound rules (simplified)
-              for rule in sg.get('IpPermissionsEgress', []):
-                  from_port = rule.get('FromPort')
-                  to_port = rule.get('ToPort')
-                  protocol = rule.get('IpProtocol', 'Unknown')
-                  
-                  for ip_range in rule.get('IpRanges', []):
-                      cidr = ip_range.get('CidrIp', 'Unknown')
-                      rule_analysis = {
-                          'direction': 'outbound',
-                          'protocol': protocol,
-                          'destination': cidr,
-                          'internet_accessible': is_internet_accessible(cidr)
-                      }
-                      analysis['outbound_rules'].append(rule_analysis)
-                      analysis['total_rules'] += 1
-              
-              return analysis
+              return critical_exposures
 
-          def scan_region_security_groups(region):
-              """Scan all security groups in a specific region."""
+          def scan_region(region):
+              """Scan security groups in a single region."""
               try:
-                  print(f"Scanning security groups in region: {region}")
+                  print(f"Scanning {region}")
                   ec2 = boto3.client('ec2', region_name=region)
-                  
-                  # Get all security groups
-                  paginator = ec2.get_paginator('describe_security_groups')
-                  
-                  region_results = {
-                      'region': region,
-                      'security_groups': [],
-                      'total_groups': 0,
-                      'internet_exposed_groups': 0,
-                      'critical_exposures': 0,
-                      'high_risk_exposures': 0,
-                      'unused_groups': 0,
-                      'scan_timestamp': datetime.now(timezone.utc).isoformat()
-                  }
                   
                   # Apply environment filter if specified
                   filters = []
                   if ENVIRONMENT_FILTER:
                       filters.append({'Name': 'tag:Environment', 'Values': [ENVIRONMENT_FILTER]})
                   
-                  for page in paginator.paginate(Filters=filters):
-                      for sg in page['SecurityGroups']:
-                          # Skip default security groups from detailed analysis unless specifically tagged
-                          if sg.get('GroupName') == 'default' and not ENVIRONMENT_FILTER:
-                              continue
-                          
-                          analysis = analyze_security_group_rules(sg, region)
-                          region_results['security_groups'].append(analysis)
-                          region_results['total_groups'] += 1
-                          
-                          if analysis['internet_exposed']:
-                              region_results['internet_exposed_groups'] += 1
-                          
-                          region_results['critical_exposures'] += len(analysis['critical_exposures'])
-                          region_results['high_risk_exposures'] += len(analysis['high_risk_exposures'])
+                  response = ec2.describe_security_groups(Filters=filters)
+                  security_groups = response['SecurityGroups']
                   
-                  # Check for unused security groups
-                  try:
-                      # Get all instances
-                      instances_response = ec2.describe_instances()
-                      used_sgs = set()
+                  # Analyze security groups
+                  internet_exposed = 0
+                  critical_exposures = []
+                  
+                  for sg in security_groups:
+                      if has_internet_exposure(sg):
+                          internet_exposed += 1
                       
-                      for reservation in instances_response['Reservations']:
-                          for instance in reservation['Instances']:
-                              for sg in instance.get('SecurityGroups', []):
-                                  used_sgs.add(sg['GroupId'])
-                      
-                      # Count unused security groups
-                      for sg_analysis in region_results['security_groups']:
-                          if sg_analysis['group_id'] not in used_sgs:
-                              region_results['unused_groups'] += 1
-                              sg_analysis['unused'] = True
-                          else:
-                              sg_analysis['unused'] = False
-                              
-                  except Exception as e:
-                      print(f"Warning: Could not check unused security groups in {region}: {str(e)}")
+                      critical_exposures.extend(get_critical_exposures(sg))
                   
-                  with scan_lock:
-                      scan_results[region] = region_results
-                  
-                  print(f"Completed {region}: {region_results['total_groups']} security groups, "
-                        f"{region_results['internet_exposed_groups']} internet-exposed")
-                  
-                  return region_results
-                  
-              except Exception as e:
-                  error_result = {
+                  return {
                       'region': region,
-                      'error': str(e),
-                      'security_groups': [],
-                      'total_groups': 0,
-                      'internet_exposed_groups': 0,
-                      'critical_exposures': 0,
-                      'high_risk_exposures': 0,
-                      'unused_groups': 0
+                      'total_groups': len(security_groups),
+                      'internet_exposed': internet_exposed,
+                      'critical_exposures': critical_exposures,
+                      'status': 'success'
                   }
                   
-                  with scan_lock:
-                      scan_results[region] = error_result
-                  
+              except Exception as e:
                   print(f"Error scanning {region}: {str(e)}")
-                  return error_result
+                  return {
+                      'region': region,
+                      'total_groups': 0,
+                      'internet_exposed': 0,
+                      'critical_exposures': [],
+                      'status': 'error',
+                      'error': str(e)
+                  }
 
-          def get_all_aws_regions():
-              """Get all available AWS regions."""
+          def get_aws_regions():
+              """Get all AWS regions."""
               try:
                   ec2 = boto3.client('ec2', region_name='us-east-1')
-                  regions_response = ec2.describe_regions()
-                  return [region['RegionName'] for region in regions_response['Regions']]
-              except Exception as e:
-                  print(f"Error getting regions, using default list: {str(e)}")
+                  response = ec2.describe_regions()
+                  return [region['RegionName'] for region in response['Regions']]
+              except:
                   # Fallback to common regions
-                  return [
-                      'us-east-1', 'us-east-2', 'us-west-1', 'us-west-2',
-                      'eu-west-1', 'eu-west-2', 'eu-west-3', 'eu-central-1',
-                      'ap-southeast-1', 'ap-southeast-2', 'ap-northeast-1',
-                      'ap-northeast-2', 'ap-south-1', 'ca-central-1',
-                      'sa-east-1'
-                  ]
+                  return ['us-east-1', 'us-west-2', 'eu-west-1', 'eu-west-2', 'ap-southeast-1']
 
-          def generate_network_security_report(scan_data, scan_id):
-              """Generate comprehensive network security HTML report."""
+          def generate_simple_report(scan_results, scan_id):
+              """Generate simple but effective HTML report."""
               
-              # Calculate global metrics
-              total_groups = sum(region.get('total_groups', 0) for region in scan_data.values())
-              total_internet_exposed = sum(region.get('internet_exposed_groups', 0) for region in scan_data.values())
-              total_critical = sum(region.get('critical_exposures', 0) for region in scan_data.values())
-              total_high_risk = sum(region.get('high_risk_exposures', 0) for region in scan_data.values())
-              total_unused = sum(region.get('unused_groups', 0) for region in scan_data.values())
+              # Calculate totals
+              total_groups = sum(r.get('total_groups', 0) for r in scan_results.values())
+              total_internet_exposed = sum(r.get('internet_exposed', 0) for r in scan_results.values())
+              all_critical_exposures = []
               
-              # Determine overall risk level
-              if total_critical > 0:
-                  risk_level, risk_color, risk_action = "Critical Risk", "#dc3545", "Immediate action required - critical services exposed to internet"
-              elif total_high_risk > 5:
-                  risk_level, risk_color, risk_action = "High Risk", "#fd7e14", "Review and secure high-risk exposures within 30 days"
-              elif total_internet_exposed > 10:
-                  risk_level, risk_color, risk_action = "Medium Risk", "#ffc107", "Review internet-exposed services and apply least privilege"
+              for region_data in scan_results.values():
+                  all_critical_exposures.extend(region_data.get('critical_exposures', []))
+              
+              # Determine risk level
+              if len(all_critical_exposures) > 0:
+                  risk_level = " CRITICAL RISK"
+                  risk_action = "Immediate action required"
+              elif total_internet_exposed > 5:
+                  risk_level = " HIGH RISK"
+                  risk_action = "Review and secure within 30 days"
               else:
-                  risk_level, risk_color, risk_action = "Low Risk", "#28a745", "Continue monitoring and periodic reviews"
-              
-              # Generate regional breakdown
-              regional_breakdown = ""
-              for region_name, region_data in scan_data.items():
-                  if region_data.get('error'):
-                      regional_breakdown += f"""
-                      <div style="margin: 15px 0; padding: 20px; border-left: 5px solid #6c757d; background: #f8f9fa; border-radius: 5px;">
-                          <h4 style="margin: 0 0 10px 0; color: #333;">{region_name}</h4>
-                          <p style="color: #dc3545;">Error: {region_data['error']}</p>
-                      </div>"""
-                      continue
-                  
-                  region_color = "#dc3545" if region_data.get('critical_exposures', 0) > 0 else "#fd7e14" if region_data.get('high_risk_exposures', 0) > 0 else "#28a745"
-                  
-                  regional_breakdown += f"""
-                  <div style="margin: 15px 0; padding: 20px; border-left: 5px solid {region_color}; background: #f8f9fa; border-radius: 5px;">
-                      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
-                          <h4 style="margin: 0; color: #333;">{region_name}</h4>
-                          <span style="background: {region_color}; color: white; padding: 5px 10px; border-radius: 4px; font-size: 12px;">
-                              {region_data.get('total_groups', 0)} Security Groups
-                          </span>
-                      </div>
-                      <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-top: 10px;">
-                          <div style="text-align: center;">
-                              <div style="font-size: 18px; font-weight: bold; color: #dc3545;">{region_data.get('critical_exposures', 0)}</div>
-                              <div style="font-size: 12px; color: #666;">Critical</div>
-                          </div>
-                          <div style="text-align: center;">
-                              <div style="font-size: 18px; font-weight: bold; color: #fd7e14;">{region_data.get('high_risk_exposures', 0)}</div>
-                              <div style="font-size: 12px; color: #666;">High Risk</div>
-                          </div>
-                          <div style="text-align: center;">
-                              <div style="font-size: 18px; font-weight: bold; color: #ffc107;">{region_data.get('internet_exposed_groups', 0)}</div>
-                              <div style="font-size: 12px; color: #666;">Internet Exposed</div>
-                          </div>
-                          <div style="text-align: center;">
-                              <div style="font-size: 18px; font-weight: bold; color: #6c757d;">{region_data.get('unused_groups', 0)}</div>
-                              <div style="font-size: 12px; color: #666;">Unused</div>
-                          </div>
-                      </div>
-                  </div>"""
+                  risk_level = " LOW RISK"
+                  risk_action = "Continue monitoring"
               
               # Generate critical findings
               critical_findings_html = ""
-              critical_count = 0
-              
-              for region_name, region_data in scan_data.items():
-                  if region_data.get('error'):
-                      continue
-                      
-                  for sg in region_data.get('security_groups', []):
-                      for exposure in sg.get('critical_exposures', []):
-                          critical_count += 1
-                          critical_findings_html += f"""
-                          <div style="margin: 10px 0; padding: 15px; border-left: 5px solid #dc3545; background: #fff5f5; border-radius: 5px;">
-                              <div style="font-weight: bold; color: #dc3545; margin-bottom: 5px;">
-                                  Critical Exposure #{critical_count}
-                              </div>
-                              <div style="margin: 5px 0;"><strong>Service:</strong> {exposure['service']} (Port {exposure['port']})</div>
-                              <div style="margin: 5px 0;"><strong>Security Group:</strong> {sg['group_name']} ({sg['group_id']})</div>
-                              <div style="margin: 5px 0;"><strong>Region:</strong> {region_name}</div>
-                              <div style="margin: 5px 0;"><strong>Source:</strong> {exposure['source']}</div>
-                              <div style="margin: 5px 0; color: #dc3545;"><strong>Risk:</strong> {exposure['service']} exposed to the entire internet</div>
-                          </div>"""
+              for i, exposure in enumerate(all_critical_exposures[:5], 1):  # Show top 5
+                  critical_findings_html += f"""
+                  <li><strong>Exposure #{i}:</strong> Port {exposure['port']} in Security Group 
+                  {exposure['sg_name']} ({exposure['sg_id']}) - CRITICAL service exposed to internet</li>
+                  """
               
               if not critical_findings_html:
-                  critical_findings_html = '<div style="text-align: center; padding: 40px; color: #28a745; font-size: 18px;">✓ No critical security exposures detected</div>'
+                  critical_findings_html = "<li>✅ No critical exposures found</li>"
               
-              # Generate HTML report
-              html_content = f"""<!DOCTYPE html>
-              <html><head>
-              <meta charset="UTF-8">
-              <title>Network Security Assessment Report</title>
-              <style>
-                  body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 20px; line-height: 1.6; color: #333; background: #fff; }}
-                  .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; text-align: center; margin-bottom: 30px; border-radius: 8px; }}
-                  .header h1 {{ margin: 0; font-size: 28px; font-weight: 300; }}
-                  .header p {{ margin: 10px 0 0 0; opacity: 0.9; font-size: 16px; }}
-                  .summary {{ background: #f8f9fa; padding: 25px; border-radius: 8px; margin-bottom: 25px; border-left: 5px solid #007bff; }}
-                  .risk-box {{ text-align: center; margin: 20px 0; }}
-                  .risk-level {{ font-size: 24px; font-weight: bold; color: {risk_color}; margin-bottom: 10px; }}
-                  .risk-action {{ font-size: 16px; color: #666; }}
-                  .metrics {{ display: grid; grid-template-columns: repeat(5, 1fr); gap: 15px; margin: 25px 0; }}
-                  .metric {{ background: white; padding: 20px; text-align: center; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
-                  .metric-value {{ font-size: 32px; font-weight: bold; margin: 0; }}
-                  .metric-label {{ font-size: 14px; color: #666; margin: 5px 0 0 0; text-transform: uppercase; letter-spacing: 1px; }}
-                  .critical .metric-value {{ color: #dc3545; }}
-                  .high .metric-value {{ color: #fd7e14; }}
-                  .medium .metric-value {{ color: #ffc107; }}
-                  .low .metric-value {{ color: #28a745; }}
-                  .info .metric-value {{ color: #6c757d; }}
-                  .details {{ background: white; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 25px; }}
-                  .details-header {{ background: #343a40; color: white; padding: 20px; font-size: 20px; font-weight: 500; border-radius: 8px 8px 0 0; margin: 0; }}
-                  .details-content {{ padding: 25px; }}
-                  .footer {{ margin-top: 30px; padding: 20px; background: #f8f9fa; border-radius: 8px; text-align: center; font-size: 14px; color: #666; }}
-                  table {{ width: 100%; border-collapse: collapse; margin: 15px 0; }}
-                  th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }}
-                  th {{ background-color: #f8f9fa; font-weight: 600; }}
-              </style>
+              # Simple HTML template
+              html_content = f"""
+              <!DOCTYPE html>
+              <html>
+              <head>
+                  <title>Network Security Assessment</title>
+                  <style>
+                      body {{ font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; }}
+                      .header {{ background: #f4f4f4; padding: 20px; border-radius: 5px; }}
+                      .metric {{ display: inline-block; margin: 10px; padding: 15px; background: #e9e9e9; border-radius: 5px; }}
+                      .critical {{ color: #d32f2f; font-weight: bold; }}
+                      .risk-box {{ background: #fff3cd; padding: 15px; border-left: 5px solid #ffc107; margin: 20px 0; }}
+                  </style>
               </head>
               <body>
-              
-              <div class="header">
-                  <h1>Network Security Assessment Report</h1>
-                  <p>AWS Security Groups Analysis - {datetime.now(timezone.utc).strftime('%B %d, %Y')}</p>
-              </div>
-              
-              <div class="summary">
-                  <h2 style="margin: 0 0 15px 0; color: #495057;">Executive Summary</h2>
-                  <p style="font-size: 16px; margin: 0 0 15px 0;">Comprehensive security group analysis across all AWS regions</p>
-                  
-                  <table>
-                      <tr><th>Scan Reference</th><td>{scan_id}</td></tr>
-                      <tr><th>Regions Scanned</th><td>{len(scan_data)} AWS regions</td></tr>
-                      <tr><th>Assessment Date</th><td>{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</td></tr>
-                      <tr><th>Total Security Groups</th><td>{total_groups} groups analyzed</td></tr>
-                      <tr><th>Environment Filter</th><td>{ENVIRONMENT_FILTER if ENVIRONMENT_FILTER else 'All environments'}</td></tr>
-                  </table>
+                  <div class="header">
+                      <h1> Network Security Assessment Report</h1>
+                      <p><strong>Scan ID:</strong> {scan_id}</p>
+                      <p><strong>Date:</strong> {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</p>
+                      <p><strong>Regions Scanned:</strong> {len(scan_results)}</p>
+                  </div>
                   
                   <div class="risk-box">
-                      <div class="risk-level">{risk_level}</div>
-                      <div class="risk-action">{risk_action}</div>
+                      <h2>{risk_level}</h2>
+                      <p><strong>Action Required:</strong> {risk_action}</p>
                   </div>
-              </div>
-              
-              <div class="metrics">
-                  <div class="metric critical">
-                      <div class="metric-value">{total_critical}</div>
-                      <div class="metric-label">Critical Exposures</div>
+                  
+                  <h2> Security Metrics</h2>
+                  <div class="metric">
+                      <h3>{total_groups}</h3>
+                      <p>Total Security Groups</p>
                   </div>
-                  <div class="metric high">
-                      <div class="metric-value">{total_high_risk}</div>
-                      <div class="metric-label">High Risk</div>
+                  <div class="metric">
+                      <h3 class="critical">{len(all_critical_exposures)}</h3>
+                      <p>Critical Exposures</p>
                   </div>
-                  <div class="metric medium">
-                      <div class="metric-value">{total_internet_exposed}</div>
-                      <div class="metric-label">Internet Exposed</div>
+                  <div class="metric">
+                      <h3>{total_internet_exposed}</h3>
+                      <p>Internet Exposed</p>
                   </div>
-                  <div class="metric info">
-                      <div class="metric-value">{total_unused}</div>
-                      <div class="metric-label">Unused Groups</div>
-                  </div>
-                  <div class="metric low">
-                      <div class="metric-value">{total_groups}</div>
-                      <div class="metric-label">Total Groups</div>
-                  </div>
-              </div>
-              
-              <div class="details">
-                  <h2 class="details-header">Critical Security Findings</h2>
-                  <div class="details-content">
+                  
+                  <h2> Critical Security Findings</h2>
+                  <ul>
                       {critical_findings_html}
-                  </div>
-              </div>
+                  </ul>
+                  
+                  <h2> Regional Summary</h2>
+                  <ul>
+              """
               
-              <div class="details">
-                  <h2 class="details-header">Regional Security Overview</h2>
-                  <div class="details-content">
-                      {regional_breakdown}
-                  </div>
-              </div>
+              # Add regional breakdown
+              for region, data in scan_results.items():
+                  if data.get('status') == 'success':
+                      html_content += f"<li><strong>{region}:</strong> {data['total_groups']} groups, {data['internet_exposed']} internet-exposed</li>"
+                  else:
+                      html_content += f"<li><strong>{region}:</strong> Error - {data.get('error', 'Unknown error')}</li>"
               
-              <div class="footer">
-                  <p><strong>Next Steps:</strong> {risk_action.lower()}</p>
-                  <p>Report generated by AWS Network Security Scanner | For technical details, contact your IT security team</p>
-                  <p>Scan ID: {scan_id} | Quarterly network security assessment</p>
-              </div>
-              
-              </body></html>"""
+              html_content += """
+                  </ul>
+                  
+                  <hr>
+                  <p><small>Report generated by AWS Network Security Scanner | Contact IT Security for details</small></p>
+              </body>
+              </html>
+              """
               
               return html_content
 
-          def convert_html_to_pdf(html_content, scan_name):
-              """Convert HTML to PDF using reportlab."""
+          def simple_pdf_conversion(html_content, scan_name):
+              """Simple HTML to PDF conversion."""
               try:
-                  from reportlab.lib.pagesizes import letter, A4
-                  from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-                  from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-                  from reportlab.lib import colors
-                  from reportlab.lib.units import inch
+                  from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+                  from reportlab.lib.styles import getSampleStyleSheet
                   import io
-                  import re
                   
-                  # Create PDF buffer
                   buffer = io.BytesIO()
-                  doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=72, leftMargin=72, topMargin=72, bottomMargin=18)
-                  
-                  # Get styles
+                  doc = SimpleDocTemplate(buffer)
                   styles = getSampleStyleSheet()
-                  
-                  # Custom styles
-                  title_style = ParagraphStyle('CustomTitle', parent=styles['Heading1'], fontSize=24, textColor=colors.HexColor('#2a5298'), alignment=1, spaceAfter=30)
-                  subtitle_style = ParagraphStyle('CustomSubtitle', parent=styles['Normal'], fontSize=14, textColor=colors.grey, alignment=1, spaceAfter=20)
-                  heading_style = ParagraphStyle('CustomHeading', parent=styles['Heading2'], fontSize=16, textColor=colors.HexColor('#495057'), spaceAfter=12)
-                  
-                  # Build story
                   story = []
                   
-                  # Title
-                  story.append(Paragraph("Network Security Assessment Report", title_style))
-                  story.append(Paragraph(f"AWS Security Groups Analysis - {datetime.now(timezone.utc).strftime('%B %d, %Y')}", subtitle_style))
+                  # Extract key information
+                  story.append(Paragraph("Network Security Assessment Report", styles['Title']))
                   story.append(Spacer(1, 20))
                   
-                  # Parse HTML content to extract key information
-                  scan_id_match = re.search(r'<td[^>]*>([^<]*network-security-[^<]*)</td>', html_content)
-                  scan_id = scan_id_match.group(1) if scan_id_match else "N/A"
+                  # Convert HTML to simple text (basic approach)
+                  text_content = re.sub('<[^<]+?>', ' ', html_content)
+                  text_content = re.sub('\s+', ' ', text_content).strip()
                   
-                  regions_match = re.search(r'<td[^>]*>(\d+[^<]*regions[^<]*)</td>', html_content)
-                  regions_scanned = regions_match.group(1) if regions_match else "N/A"
+                  # Split into paragraphs
+                  paragraphs = text_content.split('\n')
+                  for para in paragraphs:
+                      if para.strip():
+                          story.append(Paragraph(para.strip(), styles['Normal']))
+                          story.append(Spacer(1, 12))
                   
-                  date_match = re.search(r'<td[^>]*>([^<]*UTC[^<]*)</td>', html_content)
-                  scan_date = date_match.group(1) if date_match else datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
-                  
-                  # Extract risk level
-                  risk_match = re.search(r'<div class="risk-level">([^<]*)</div>', html_content)
-                  risk_level = risk_match.group(1).strip() if risk_match else "Low Risk"
-                  
-                  # Extract metrics
-                  critical_match = re.search(r'<div class="metric critical">.*?<div class="metric-value">(\d+)</div>', html_content, re.DOTALL)
-                  high_match = re.search(r'<div class="metric high">.*?<div class="metric-value">(\d+)</div>', html_content, re.DOTALL)
-                  exposed_match = re.search(r'<div class="metric medium">.*?<div class="metric-value">(\d+)</div>', html_content, re.DOTALL)
-                  unused_match = re.search(r'<div class="metric info">.*?<div class="metric-value">(\d+)</div>', html_content, re.DOTALL)
-                  total_match = re.search(r'<div class="metric low">.*?<div class="metric-value">(\d+)</div>', html_content, re.DOTALL)
-                  
-                  critical_count = critical_match.group(1) if critical_match else "0"
-                  high_count = high_match.group(1) if high_match else "0"
-                  exposed_count = exposed_match.group(1) if exposed_match else "0"
-                  unused_count = unused_match.group(1) if unused_match else "0"
-                  total_count = total_match.group(1) if total_match else "0"
-                  
-                  # Executive Summary
-                  story.append(Paragraph("Executive Summary", heading_style))
-                  
-                  # Summary table
-                  summary_data = [
-                      ['Scan Reference', scan_id],
-                      ['Regions Scanned', regions_scanned],
-                      ['Assessment Date', scan_date],
-                      ['Risk Level', risk_level],
-                      ['Total Security Groups', total_count]
-                  ]
-                  
-                  summary_table = Table(summary_data, colWidths=[2*inch, 4*inch])
-                  summary_table.setStyle(TableStyle([
-                      ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f8f9fa')),
-                      ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
-                      ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                      ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
-                      ('FONTSIZE', (0, 0), (-1, -1), 10),
-                      ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#ddd')),
-                      ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-                      ('LEFTPADDING', (0, 0), (-1, -1), 12),
-                      ('RIGHTPADDING', (0, 0), (-1, -1), 12),
-                      ('TOPPADDING', (0, 0), (-1, -1), 8),
-                      ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-                  ]))
-                  
-                  story.append(summary_table)
-                  story.append(Spacer(1, 20))
-                  
-                  # Network Security Metrics
-                  story.append(Paragraph("Network Security Findings Summary", heading_style))
-                  
-                  metrics_data = [
-                      ['Security Category', 'Count', 'Risk Assessment'],
-                      ['Critical Exposures', critical_count, 'Immediate attention required - services exposed to internet' if int(critical_count) > 0 else 'None found'],
-                      ['High Risk Exposures', high_count, 'Review and secure within 30 days' if int(high_count) > 0 else 'None found'],
-                      ['Internet Exposed Groups', exposed_count, 'Apply least privilege principle' if int(exposed_count) > 0 else 'None found'],
-                      ['Unused Security Groups', unused_count, 'Consider removal to reduce attack surface' if int(unused_count) > 0 else 'None found']
-                  ]
-                  
-                  metrics_table = Table(metrics_data, colWidths=[1.8*inch, 1*inch, 3.2*inch])
-                  metrics_table.setStyle(TableStyle([
-                      ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#343a40')),
-                      ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                      ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                      ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                      ('FONTNAME', (0, 1), (0, -1), 'Helvetica-Bold'),
-                      ('FONTSIZE', (0, 0), (-1, -1), 10),
-                      ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#ddd')),
-                      ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-                      ('LEFTPADDING', (0, 0), (-1, -1), 12),
-                      ('RIGHTPADDING', (0, 0), (-1, -1), 12),
-                      ('TOPPADDING', (0, 0), (-1, -1), 8),
-                      ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-                  ]))
-                  
-                  # Color code the rows
-                  if int(critical_count) > 0:
-                      metrics_table.setStyle(TableStyle([('BACKGROUND', (0, 1), (-1, 1), colors.HexColor('#ffe6e6'))]))
-                  if int(high_count) > 0:
-                      metrics_table.setStyle(TableStyle([('BACKGROUND', (0, 2), (-1, 2), colors.HexColor('#fff3e0'))]))
-                  if int(exposed_count) > 0:
-                      metrics_table.setStyle(TableStyle([('BACKGROUND', (0, 3), (-1, 3), colors.HexColor('#fffbf0'))]))
-                  
-                  story.append(metrics_table)
-                  story.append(Spacer(1, 20))
-                  
-                  # Recommendations
-                  story.append(Paragraph("Security Recommendations", heading_style))
-                  
-                  total_issues = int(critical_count) + int(high_count)
-                  if total_issues > 0:
-                      if int(critical_count) > 0:
-                          recommendations = [
-                              "• Immediately review and restrict critical service exposures to specific IP ranges",
-                              "• Remove 0.0.0.0/0 access for SSH, RDP, and database ports",
-                              "• Implement bastion hosts or VPN access for administrative services",
-                              "• Enable VPC Flow Logs for network traffic monitoring"
-                          ]
-                      elif int(high_count) > 0:
-                          recommendations = [
-                              "• Review high-risk port exposures and apply least privilege principle",
-                              "• Consider using Application Load Balancers for web services",
-                              "• Implement Web Application Firewall (WAF) for internet-facing services",
-                              "• Regular review of security group rules"
-                          ]
-                      else:
-                          recommendations = [
-                              "• Continue monitoring network access patterns",
-                              "• Regular quarterly security group audits",
-                              "• Consider implementing AWS Config rules for compliance"
-                          ]
-                  else:
-                      recommendations = [
-                          "• Excellent security posture - continue current practices",
-                          "• Regular quarterly reviews recommended",
-                          "• Consider automated compliance monitoring"
-                      ]
-                  
-                  for rec in recommendations:
-                      story.append(Paragraph(rec, styles['Normal']))
-                  
-                  story.append(Spacer(1, 30))
-                  
-                  # Footer
-                  footer_text = f"Report generated by AWS Network Security Scanner | Quarterly Assessment | Scan ID: {scan_id}"
-                  footer_style = ParagraphStyle('Footer', parent=styles['Normal'], fontSize=8, textColor=colors.grey, alignment=1)
-                  story.append(Paragraph(footer_text, footer_style))
-                  
-                  # Build PDF
                   doc.build(story)
                   pdf_data = buffer.getvalue()
                   buffer.close()
                   
-                  print(f"Generated network security PDF report: {len(pdf_data)} bytes")
+                  print(f"Generated simplified PDF: {len(pdf_data)} bytes")
                   return pdf_data
                   
               except Exception as e:
                   print(f"PDF generation failed: {str(e)}")
-                  raise e
+                  raise
 
-          def upload_report_and_notify(pdf_data, scan_name, scan_id, scan_summary):
-              """Upload PDF report to S3 and send SNS notification."""
+          def upload_report_and_notify(pdf_data, html_content, scan_id, scan_results):
+              """Upload report and send notification."""
               try:
                   s3_client = boto3.client('s3')
                   
-                  # Create S3 key with proper structure
-                  year_month = datetime.now(timezone.utc).strftime('%Y-%m')
-                  s3_key = f"network-security-reports/{ENVIRONMENT_FILTER if ENVIRONMENT_FILTER else 'all-environments'}/{year_month}/network-security-assessment.pdf"
-                  
                   # Upload to S3
+                  year_month = datetime.now(timezone.utc).strftime('%Y-%m')
+                  s3_key = f"network-security-reports/{ENVIRONMENT_FILTER if ENVIRONMENT_FILTER else 'all'}/{year_month}/network-security-assessment.pdf"
+                  
                   s3_client.put_object(
                       Bucket=REPORTS_BUCKET,
                       Key=s3_key,
                       Body=pdf_data,
-                      ContentType='application/pdf',
-                      Metadata={
-                          'scan-name': scan_name,
-                          'scan-id': scan_id,
-                          'scan-type': 'network-security',
-                          'generated-at': datetime.now(timezone.utc).isoformat(),
-                          'environment': ENVIRONMENT_FILTER if ENVIRONMENT_FILTER else 'all'
-                      }
+                      ContentType='application/pdf'
                   )
                   
-                  # Generate presigned URL
-                  pdf_url = s3_client.generate_presigned_url(
-                      'get_object',
-                      Params={'Bucket': REPORTS_BUCKET, 'Key': s3_key},
-                      ExpiresIn=86400  # 24 hours
-                  )
+                  pdf_url = s3_client.generate_presigned_url('get_object', 
+                      Params={'Bucket': REPORTS_BUCKET, 'Key': s3_key}, ExpiresIn=86400)
                   
-                  print(f"Network security report uploaded to S3: s3://{REPORTS_BUCKET}/{s3_key}")
+                  print(f"Report uploaded to S3: s3://{REPORTS_BUCKET}/{s3_key}")
                   
               except Exception as e:
-                  print(f"Could not upload PDF to S3: {str(e)}")
+                  print(f"S3 upload failed: {str(e)}")
                   pdf_url = None
               
               # Send SNS notification
               try:
-                  message = f"""AWS Network Security Assessment completed.
+                  total_groups = sum(r.get('total_groups', 0) for r in scan_results.values())
+                  total_critical = sum(len(r.get('critical_exposures', [])) for r in scan_results.values())
+                  
+                  message = f"""AWS Network Security Assessment Completed
 
-          Scan: {scan_name}
-          ID: {scan_id}
-          Type: Network Security Groups Analysis
-          Scope: {len(scan_summary)} AWS regions
+          Scan ID: {scan_id}
+          Regions Scanned: {len(scan_results)}
+          Total Security Groups: {total_groups}
+          Critical Exposures: {total_critical}
 
-          Security Summary:
-          • Total Security Groups: {sum(region.get('total_groups', 0) for region in scan_summary.values())}
-          • Critical Exposures: {sum(region.get('critical_exposures', 0) for region in scan_summary.values())}
-          • High Risk Exposures: {sum(region.get('high_risk_exposures', 0) for region in scan_summary.values())}
-          • Internet Exposed Groups: {sum(region.get('internet_exposed_groups', 0) for region in scan_summary.values())}
-          • Unused Security Groups: {sum(region.get('unused_groups', 0) for region in scan_summary.values())}
+          Report: {pdf_url if pdf_url else 'Upload failed'}
 
-          Environment Filter: {ENVIRONMENT_FILTER if ENVIRONMENT_FILTER else 'All environments'}
-
-          Security Report: {pdf_url if pdf_url else 'Upload in progress...'}
-
-          For questions, contact your IT security team."""
+          Contact IT Security for details."""
                   
                   sns.publish(
                       TopicArn=SNS_TOPIC_ARN,
-                      Subject=f"Network Security Assessment Report - {scan_name}",
+                      Subject=f"Network Security Assessment - {scan_id}",
                       Message=message
                   )
                   
-                  print("Network security assessment notification sent")
+                  print("Notification sent successfully")
                   
               except Exception as e:
-                  print(f"Could not send SNS notification: {str(e)}")
-              
-              return pdf_url
+                  print(f"SNS notification failed: {str(e)}")
 
           def lambda_handler(event, context):
-              """Main Lambda handler for network security scanning."""
+              """Simplified Lambda handler."""
               print("Starting AWS Network Security Assessment...")
               
               try:
-                  # Get all AWS regions
-                  regions = get_all_aws_regions()
-                  print(f"Scanning {len(regions)} AWS regions for security groups")
+                  # Get regions and scan
+                  regions = get_aws_regions()
+                  print(f"Scanning {len(regions)} AWS regions")
                   
-                  # Scan all regions in parallel (with limited concurrency to avoid throttling)
-                  max_workers = min(10, len(regions))  # Limit concurrent requests
+                  scan_results = {}
+                  for region in regions:
+                      scan_results[region] = scan_region(region)
                   
-                  with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                      # Submit all region scan tasks
-                      future_to_region = {
-                          executor.submit(scan_region_security_groups, region): region 
-                          for region in regions
-                      }
-                      
-                      # Collect results as they complete
-                      completed_regions = 0
-                      for future in as_completed(future_to_region):
-                          region = future_to_region[future]
-                          try:
-                              result = future.result()
-                              completed_regions += 1
-                              print(f"Progress: {completed_regions}/{len(regions)} regions completed")
-                          except Exception as e:
-                              print(f"Region {region} scan failed: {str(e)}")
+                  print(f"Multi-region scan completed")
                   
-                  print(f"Multi-region scan completed. Results from {len(scan_results)} regions")
-                  
-                  # Generate scan identifiers
+                  # Generate report
                   scan_id = f"network-security-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
-                  scan_name = f"network-assessment-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M')}"
                   
-                  print("Generating comprehensive network security report...")
-                  
-                  # Generate HTML report
-                  html_content = generate_network_security_report(scan_results, scan_id)
-                  
-                  # Convert to PDF
-                  pdf_data = convert_html_to_pdf(html_content, scan_name)
+                  html_content = generate_simple_report(scan_results, scan_id)
+                  pdf_data = simple_pdf_conversion(html_content, scan_id)
                   
                   # Upload and notify
-                  pdf_url = upload_report_and_notify(pdf_data, scan_name, scan_id, scan_results)
+                  upload_report_and_notify(pdf_data, html_content, scan_id, scan_results)
                   
-                  # Calculate final summary
-                  total_groups = sum(region.get('total_groups', 0) for region in scan_results.values())
-                  total_critical = sum(region.get('critical_exposures', 0) for region in scan_results.values())
-                  total_high_risk = sum(region.get('high_risk_exposures', 0) for region in scan_results.values())
+                  # Summary
+                  total_groups = sum(r.get('total_groups', 0) for r in scan_results.values())
+                  total_critical = sum(len(r.get('critical_exposures', [])) for r in scan_results.values())
                   
-                  print("Network security assessment completed successfully")
-                  print(f"Scanned {total_groups} security groups across {len(scan_results)} regions")
-                  print(f"Found {total_critical} critical exposures and {total_high_risk} high-risk exposures")
-                  print(f"PDF report generated: {len(pdf_data)} bytes")
+                  print(f"Assessment completed: {total_groups} groups, {total_critical} critical exposures")
                   
                   return {
                       "statusCode": 200,
                       "body": {
                           "message": f"Network security assessment completed: {scan_id}",
-                          "regions_scanned": len(scan_results),
-                          "total_security_groups": total_groups,
-                          "critical_exposures": total_critical,
-                          "high_risk_exposures": total_high_risk,
-                          "report_url": pdf_url
+                          "total_groups": total_groups,
+                          "critical_exposures": total_critical
                       }
                   }
                   
               except Exception as e:
-                  print(f"Network security assessment failed: {str(e)}")
-                  return {
-                      "statusCode": 500,
-                      "body": f"Network security assessment failed: {str(e)}"
-                  }
+                  print(f"Assessment failed: {str(e)}")
+                  return {"statusCode": 500, "body": f"Assessment failed: {str(e)}"}
           EOF
 
           # Create ZIP package
